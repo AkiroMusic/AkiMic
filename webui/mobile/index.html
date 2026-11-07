@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0C1220">
+<title>AkiMic</title>
+<link rel="stylesheet" href="/assets/tokens.css">
+<link rel="stylesheet" href="/assets/mobile.css">
+<script src="/vendor/socket.io.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <header class="m-head">
+    <div class="brand">
+      <svg class="aki-star star-bloom" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2 C12.7 7.3 16.7 11.3 22 12 C16.7 12.7 12.7 16.7 12 22 C11.3 16.7 7.3 12.7 2 12 C7.3 11.3 11.3 7.3 12 2 Z"/></svg>
+      <span class="brand-name">AkiMic</span>
+    </div>
+    <button class="lang-btn" id="btn-lang"><span id="lang-label">EN</span></button>
+  </header>
+
+  <section class="status-card spring-in">
+    <div class="status-left">
+      <span class="status-eyebrow" data-i18n="m_host_status">HOST</span>
+      <span class="status-line">
+        <span class="dot wait" id="host-dot"></span>
+        <span id="host-text" data-i18n="m_wait_conn">Connecting…</span>
+      </span>
+      <span class="status-sub" id="link-sub"></span>
+    </div>
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="color: var(--text-tertiary); opacity: 0.7;"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+  </section>
+
+  <div class="mic-section">
+    <button class="mic-btn" id="mic-btn">
+      <svg id="mic-icon" width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+      <span class="btn-label" id="mic-label" data-i18n="m_tap_start">Tap to start</span>
+    </button>
+  </div>
+
+  <div class="vu-meter" id="vu-meter" aria-hidden="true"></div>
+
+  <div class="mic-state" id="mic-state" data-i18n="m_hint">Keep this page open while talking</div>
+
+  <section class="gain-card spring-in">
+    <div class="gain-row">
+      <span class="gain-label" data-i18n="m_gain">Gain</span>
+      <input type="range" id="gain-slider" min="0" max="3" step="0.1" value="1">
+      <span class="gain-value" id="gain-value">×1.0</span>
+    </div>
+  </section>
+
+  <footer class="m-foot">
+    <div class="rtt-line">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+      <span data-i18n="m_rtt">RTT</span>
+      <span id="rtt-value">—</span>
+    </div>
+  </footer>
+</div>
+
+<!-- permission denied dialog -->
+<div class="modal-mask" id="modal-denied" hidden>
+  <div class="modal spring-in">
+    <h3 data-i18n="m_denied_title">Microphone blocked</h3>
+    <p data-i18n="m_denied_desc">Allow microphone access for this page in your browser settings, then tap retry.</p>
+    <button class="btn" id="denied-ok" data-i18n="m_ok">OK</button>
+  </div>
+</div>
+
+<script src="/assets/mobile.js"></script>
+</body>
+</html>

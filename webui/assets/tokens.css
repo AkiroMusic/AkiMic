@@ -1,0 +1,191 @@
+/* ============================================================
+   AkiMic Design Tokens — Aurora Dusk palette, flat rendering
+   ============================================================ */
+
+@font-face {
+  font-family: 'Plus Jakarta Sans';
+  src: url('fonts/PlusJakartaSans.woff2') format('woff2');
+  font-weight: 200 800;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Plus Jakarta Sans';
+  src: url('fonts/PlusJakartaSans-Italic.woff2') format('woff2');
+  font-weight: 200 800;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Fraunces';
+  src: url('fonts/Fraunces.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  src: url('fonts/IBMPlexMono-400.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  src: url('fonts/IBMPlexMono-600.woff2') format('woff2');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  /* ---- Colors — Aurora Dusk ramp (main pack) ---- */
+  --bg-base: #0C1220;
+  --surface-1: #151C2C;
+  --surface-2: #1E2839;
+  --surface-contrast: #060A14;
+  --border: #2B3852;
+  --text-primary: #EEF2F8;
+  --text-secondary: #8C97AC;
+  --text-tertiary: #5A6478;
+
+  --accent: #6D82FF;
+  --accent-hover: #8A9BFF;
+  --accent-secondary: #2CC5E0;
+  --accent-tertiary: #F0A0D8;
+  --success: #4FAE8A;
+  --error: #D9695F;
+  --warning: #E8A33D;
+
+  /* ---- Gradient ramp (level meters / accents only) ---- */
+  --grad-a: #4860D9;
+  --grad-b: #2CC5E0;
+  --grad-c: #C4A8F5;
+
+  /* ---- Radius ---- */
+  --radius-sm: 10px;
+  --radius-md: 16px;
+  --radius-lg: 24px;
+  --radius-xl: 32px;
+  --radius-full: 999px;
+
+  /* ---- Spacing ---- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-12: 48px;
+
+  /* ---- Motion ---- */
+  --ease-default: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
+  --duration-hover: 150ms;
+  --duration-spring: 320ms;
+
+  /* ---- Typography ---- */
+  --font-sans: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  --font-display: 'Fraunces', Georgia, serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
+}
+
+/* ---- Optional color packs ---- */
+[data-theme='amber'] {
+  --bg-base: #1A1210; --surface-1: #261916; --surface-2: #32211C;
+  --surface-contrast: #140C0A; --border: #4A332B;
+  --text-primary: #F5EDE4; --text-secondary: #A89688; --text-tertiary: #6E5F52;
+  --accent: #E58A5A; --accent-hover: #F0A276;
+  --accent-secondary: #F2C28F; --accent-tertiary: #D98E9C;
+  --grad-a: #B84A3A; --grad-b: #E58A5A; --grad-c: #F2C28F;
+  --success: #58A873; --error: #E06552; --warning: #E8A33D;
+}
+[data-theme='mint'] {
+  --bg-base: #E8F0E5; --surface-1: #F4F8F0; --surface-2: #DCE7DA;
+  --surface-contrast: #22362A; --border: #C9D8C6;
+  --text-primary: #2F4A3A; --text-secondary: #6B7268; --text-tertiary: #98A69A;
+  --accent: #3D624C; --accent-hover: #32513F;
+  --accent-secondary: #8FA89A; --accent-tertiary: #D9A38E;
+  --grad-a: #8FA89A; --grad-b: #A3C4A9; --grad-c: #B5D7C3;
+  --success: #4E8F68; --error: #C4584E; --warning: #C08A3D;
+}
+[data-theme='pearl'] {
+  --bg-base: #F0E8EE; --surface-1: #FAF5F8; --surface-2: #E4D8E2;
+  --surface-contrast: #2E2430; --border: #D4C4D2;
+  --text-primary: #3A2F3C; --text-secondary: #8A7A8C; --text-tertiary: #B4A6B6;
+  --accent: #B27A94; --accent-hover: #9C6580;
+  --accent-secondary: #9B86BE; --accent-tertiary: #7E9CC0;
+  --grad-a: #D9AFC0; --grad-b: #C8B7D8; --grad-c: #AFC5DE;
+  --success: #5A9E7A; --error: #C45868; --warning: #C08A3D;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background-color: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  letter-spacing: 0.01em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+  user-select: none;
+}
+* { box-sizing: border-box; }
+
+/* ---- Motion ---- */
+.spring-in {
+  animation: springIn var(--duration-spring) var(--ease-spring) both;
+}
+@keyframes springIn {
+  from { opacity: 0; transform: translateY(10px) scale(0.985); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* ---- Signature: Aki Star bloom ---- */
+@keyframes starBloom {
+  from { opacity: 0; transform: scale(0) rotate(-90deg); }
+  to   { opacity: 1; transform: scale(1) rotate(0deg); }
+}
+.star-bloom {
+  animation: starBloom var(--duration-spring) var(--ease-spring) both;
+  transform-origin: center;
+  animation-delay: calc(var(--bloom-order, 0) * 60ms);
+}
+
+/* ---- Utilities ---- */
+::selection {
+  background: color-mix(in srgb, var(--grad-b) 32%, transparent);
+  color: var(--text-primary);
+}
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+.text-eyebrow {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.no-scrollbar { scrollbar-width: none; -ms-overflow-style: none; }
+.no-scrollbar::-webkit-scrollbar { display: none; }
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-tertiary); }
+
+/* ---- Reduced motion ---- */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

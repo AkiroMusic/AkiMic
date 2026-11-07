@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# PyInstaller
+build/
+dist/
+
+# Runtime artifacts
+settings.json
+*.log
+
+# Reference project (kept read-only, never tracked)
+REF-ZeroMic-main/
