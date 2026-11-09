@@ -1,6 +1,26 @@
-# AkiMic
+# AkiMic — Wireless Microphone for Windows
+
+[![Website](https://img.shields.io/badge/site-akiromusic.github.io-6D82FF)](https://akiromusic.github.io/AkiMic/)
+[![Release](https://img.shields.io/github/v/release/AkiroMusic/AkiMic?style=flat-square&label=Latest%20Release&color=6C8CFF)](https://github.com/AkiroMusic/AkiMic/releases/latest)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-2CC5E0?style=flat-square)](https://github.com/AkiroMusic/AkiMic)
+[![License](https://img.shields.io/badge/license-GPL--3.0-6C8CFF?style=flat-square)](LICENSE)
 
 **EN** | [中文](#中文)
+
+**AkiMic** turns your phone into a wireless microphone for your Windows PC. Audio streams over LAN WebRTC straight into a virtual audio device — one click to set up, nothing to install on the phone: scan a QR code, tap once, talk.
+
+> **v1.0.0 — One-click flow**
+> Launch and everything is automatic: virtual driver check, firewall rules (no security popups), trusted local certificate, QR pairing and device matching. Auto-reconnect survives lock screens and Wi-Fi hiccups.
+
+## Download
+
+| Platform | File | Notes |
+|----------|------|-------|
+| Windows 10/11 x64 | [AkiMic.exe](https://github.com/AkiroMusic/AkiMic/releases/latest/download/AkiMic.exe) | Portable single exe — run as administrator (first run sets up the virtual device) |
+
+Requires the free [VB-CABLE](https://vb-audio.com/Cable/) virtual audio device — AkiMic detects and installs it automatically on first launch.
+
+---
 
 Turn your phone into your PC's wireless microphone — one click, over LAN WebRTC, with an Aurora Glass UI.
 
@@ -84,6 +104,21 @@ GPL-3.0 (see `LICENSE`). Inspired by ZeroMic by Hypixice Studio; VB-CABLE is a s
 ---
 
 # 中文
+
+**AkiMic** 把手机变成 Windows 电脑的无线麦克风：音频经局域网 WebRTC 直连进虚拟声卡——一键配置，手机无需安装任何 App：扫码、点一下、开说。
+
+> **v1.0.0 —— 一键流程**
+> 启动后全自动：虚拟驱动检测、防火墙放行（不弹安全警报）、本机受信任证书、扫码配对与设备匹配。自动重连可穿越锁屏与 Wi-Fi 抖动。
+
+## 下载
+
+| 平台 | 文件 | 说明 |
+|------|------|------|
+| Windows 10/11 x64 | [AkiMic.exe](https://github.com/AkiroMusic/AkiMic/releases/latest/download/AkiMic.exe) | 绿色单文件——以管理员运行（首跑自动配置虚拟设备） |
+
+需要免费的 [VB-CABLE](https://vb-audio.com/Cable/) 虚拟声卡——AkiMic 首次启动会自动检测并安装。
+
+---
 
 把手机变成电脑的无线麦克风——一键启动、局域网 WebRTC、Aurora Glass 界面。
 
