@@ -186,9 +186,17 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
             patch = _json_object()
             if patch is None:
                 return jsonify({"error": "expected a JSON object"}), 400
-            if not _is_loopback():
-                # phones may only touch their own gain and the shared language
+            if _is_loopback() and ctx.desktop_token and secrets.compare_digest(
+                    request.headers.get("X-AkiMic-Token", ""), ctx.desktop_token):
+                pass  # authenticated desktop: full settings write
+            elif (not _is_loopback() and ctx.pairing_secret
+                  and secrets.compare_digest(
+                      request.headers.get("X-AkiMic-Pairing-Token", ""),
+                      ctx.pairing_secret)):
+                # authenticated phone: only its own gain and shared language
                 patch = {k: v for k, v in patch.items() if k in ("mobile_gain", "lang")}
+            else:
+                return jsonify({"error": "not authorized"}), 403
             known = [k for k in patch if k in DEFAULTS]
             valid = {k: v for k, v in patch.items()
                      if ctx.settings.validate_key(k, v) is not None}
@@ -335,30 +343,41 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
     @socketio.on("offer")
     def on_offer(data):
         nonlocal active_offer_sid
-        if sid_role.get(request.sid) != "mobile" or not _valid_sdp(data, "offer"):
+        if not _valid_sdp(data, "offer"):
             return
-        active_offer_sid = request.sid
-        if desktop_sid:
-            emit("offer", data, to=desktop_sid)
+        with state_lock:
+            if sid_role.get(request.sid) != "mobile":
+                return
+            target = desktop_sid
+            active_offer_sid = request.sid
+        if target:  # emit outside the lock (callbacks mutate the same state)
+            emit("offer", data, to=target)
 
     @socketio.on("answer")
     def on_answer(data):
-        if sid_role.get(request.sid) != "desktop" or not _valid_sdp(data, "answer"):
+        if not _valid_sdp(data, "answer"):
             return
-        if active_offer_sid:
-            emit("answer", data, to=active_offer_sid)
+        with state_lock:
+            if sid_role.get(request.sid) != "desktop":
+                return
+            target = active_offer_sid
+        if target:
+            emit("answer", data, to=target)
 
     @socketio.on("ice_candidate")
     def on_ice_candidate(data):
-        role = sid_role.get(request.sid)
         if not _valid_candidate(data):
             return
-        if role == "mobile":
-            if desktop_sid:
-                emit("ice_candidate", data, to=desktop_sid)
-        elif role == "desktop":
-            if active_offer_sid:
-                emit("ice_candidate", data, to=active_offer_sid)
+        with state_lock:
+            role = sid_role.get(request.sid)
+            if role == "mobile":
+                target = desktop_sid
+            elif role == "desktop":
+                target = active_offer_sid
+            else:
+                return
+        if target:
+            emit("ice_candidate", data, to=target)
 
     @socketio.on("mute_state")
     def on_mute_state(data):

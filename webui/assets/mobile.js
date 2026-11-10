@@ -26,6 +26,17 @@ function t(key) { return S.i18n[key] || key; }
 
 /* ---------- i18n ---------- */
 
+function persistSetting(patch) {
+  // phones authenticate with the pairing token from the QR URL and may
+  // only write their own gain / shared language (enforced server-side)
+  return fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json',
+               'X-AkiMic-Pairing-Token': PAIRING_TOKEN },
+    body: JSON.stringify(patch),
+  }).catch(() => {});
+}
+
 async function loadLang(code) {
   try {
     const res = await fetch(`/lang/${code}.json?t=${Date.now()}`);
@@ -39,11 +50,7 @@ async function loadLang(code) {
     $('lang-label').textContent = code === 'zh_cn' ? 'EN' : '中';
     updateUI();
     // persist the shared language preference (same key the desktop uses)
-    fetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ lang: code }),
-    }).catch(() => {});
+    persistSetting({ lang: code });
   } catch (e) { console.warn('lang load failed', e); }
 }
 
@@ -155,7 +162,12 @@ function closePc() {
 }
 
 async function startStreaming() {
-  // requires S.stream + audio graph already built
+  // single precondition gate: every entry point (button, reconnect,
+  // room_state, visibilitychange) funnels through here
+  if (S.joined !== true || !S.desktopOnline) {
+    S.retryTimer = setTimeout(startStreaming, 2100);
+    return;
+  }
   if (!S.stream || !S.dest || !S.socket || !S.socket.connected) return;
   const now = Date.now();
   if (now - S.lastAttempt < 2000) {
@@ -316,12 +328,11 @@ function connectSocket() {
   S.socket = socket;
 
   socket.on('connect', () => {
+    // join FIRST; the offer only goes out once room_state confirms the
+    // desktop is online (server drops offers from unjoined SIDs anyway)
     socket.emit('join', { role: 'mobile', token: PAIRING_TOKEN });
     updateUI();
     reportMuteState();
-    if (S.mode !== 'idle' && S.pcState !== 'connected') {
-      startStreaming().catch(() => scheduleRestart());
-    }
   });
 
   socket.on('room_state', (data) => {
@@ -329,6 +340,11 @@ function connectSocket() {
     S.joined = true;
     S.desktopOnline = !!(data && data.desktop_online);
     updateUI();
+    // desktop came back while we were already capturing: (re)negotiate now
+    if (S.desktopOnline && (S.mode === 'live' || S.mode === 'muted')
+        && S.pcState !== 'connected') {
+      startStreaming().catch(() => scheduleRestart());
+    }
   });
 
   socket.on('join_rejected', (data) => {
@@ -359,8 +375,6 @@ function connectSocket() {
     S.desktopOnline = false;
     updateUI();
   });
-
-  socket.on('disconnect', () => { updateUI(); });
 
   socket.on('answer', async (data) => {
     // ignore stale/duplicate answers (reconnects can race old peers)
@@ -420,11 +434,7 @@ async function init() {
     if (S.gainNode && S.mode === 'live') S.gainNode.gain.value = v;
   });
   $('gain-slider').addEventListener('change', (e) => {
-    fetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mobile_gain: parseFloat(e.target.value) }),
-    }).catch(() => {});
+    persistSetting({ mobile_gain: parseFloat(e.target.value) });
   });
 
   document.addEventListener('visibilitychange', async () => {

@@ -213,7 +213,6 @@ async function loadDevices() {
       }
     }
     if (probe) probe.getTracks().forEach((tr) => tr.stop());
-    if (probe) probe.getTracks().forEach((tr) => tr.stop());
 
     devices = await navigator.mediaDevices.enumerateDevices();
   } catch (e) {

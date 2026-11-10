@@ -151,7 +151,7 @@ def _rule_exists(name: str) -> bool:
     return code == 0 and name in out and "No rules match" not in out
 
 
-def ensure_firewall_rules() -> tuple[bool, str, bool]:
+def ensure_firewall_rules() -> tuple[bool, str, tuple[str, ...]]:
     """Allow phone→PC traffic: TCP 5000-5100 for the signaling server and
     UDP ephemeral ports for WebRTC ICE (WebView2 binds them when the phone
     connects — without this Windows pops the security alert on every
@@ -159,11 +159,11 @@ def ensure_firewall_rules() -> tuple[bool, str, bool]:
     Both rules are scoped to the local subnet. Per-rule idempotent, so a
     partial previous run is completed rather than wiped and rebuilt.
 
-    Returns (ok, message, added_by_us) — added_by_us lets the caller roll
-    back only rules this boot created, never pre-existing same-name rules.
+    Returns (ok, message, created_names) — created_names lets the caller
+    roll back ONLY the rules this boot created, never pre-existing ones.
     """
     if sys.platform != "win32":
-        return True, "firewall management is Windows-only, skipped", False
+        return True, "firewall management is Windows-only, skipped", ()
 
     rules = (
         (FIREWALL_RULE_NAME, "TCP", f"{PORT_RANGE_START}-{PORT_RANGE_END}", "AkiMic LAN signaling"),
@@ -171,7 +171,7 @@ def ensure_firewall_rules() -> tuple[bool, str, bool]:
     )
     ok = True
     parts = []
-    added = False
+    created: list[str] = []
     for name, proto, port, desc in rules:
         if _rule_exists(name):
             parts.append(f"{proto}: present")
@@ -184,21 +184,25 @@ def ensure_firewall_rules() -> tuple[bool, str, bool]:
             f"description={desc}",
         ])
         if code == 0:
-            added = True
+            created.append(name)
             parts.append(f"{proto}: added")
         else:
             ok = False
             parts.append(f"{proto}: FAILED ({out.strip()[:80]})")
-    return ok, "; ".join(parts), added
+    return ok, "; ".join(parts), tuple(created)
 
 
-def remove_firewall_rules() -> tuple[bool, str]:
-    """Remove AkiMic's rules; missing rules count as success (idempotent)."""
+def remove_firewall_rules(names: tuple[str, ...] | None = None) -> tuple[bool, str]:
+    """Remove the given AkiMic rules (default: both known rules).
+    Missing rules count as success (idempotent). Passing an explicit name
+    tuple lets the caller roll back only rules it created this boot."""
     if sys.platform != "win32":
         return True, "skipped"
+    if names is None:
+        names = (FIREWALL_RULE_NAME, FIREWALL_RULE_ICE)
     ok = True
     removed = 0
-    for name in (FIREWALL_RULE_NAME, FIREWALL_RULE_ICE):
+    for name in names:
         if not _rule_exists(name):
             continue
         code, _out = _netsh(["delete", "rule", f"name={name}"])

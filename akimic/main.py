@@ -68,14 +68,14 @@ def run() -> None:
     # TCP for the page, UDP for WebRTC ICE — without the UDP rule Windows
     # pops a security alert on every phone connection and cancelling it
     # kills the audio. Best effort; the packaged exe runs elevated.
-    fw_ok, fw_msg, fw_added = net.ensure_firewall_rules()
+    fw_ok, fw_msg, fw_created = net.ensure_firewall_rules()
     if not fw_ok:
         print(f"[{APP_NAME}] firewall rules skipped: {fw_msg}")
 
     def _rollback_startup():
         """Remove only the rules this boot created — never pre-existing ones."""
-        if fw_added:
-            net.remove_firewall_rules()
+        if fw_created:
+            net.remove_firewall_rules(fw_created)
 
     # Persistent self-signed cert, trusted on this PC once (admin install).
     # Falls back to werkzeug's adhoc cert when generation fails.
@@ -111,74 +111,81 @@ def run() -> None:
         _alert(APP_NAME, f"{APP_NAME} server failed to start:\n{ready_msg}")
         return
 
-    icon_path = os.path.join(base_path, "assets", "icon.ico")
-    png_path = os.path.join(base_path, "assets", "icon.png")
+    # everything after this point is GUI assembly — a failure here is still
+    # a failed boot and must not leave this run's firewall rules behind
+    try:
+        icon_path = os.path.join(base_path, "assets", "icon.ico")
+        png_path = os.path.join(base_path, "assets", "icon.png")
 
-    import webview
+        import webview
 
-    class WindowApi:
-        """JS bridge for the frameless window controls."""
-        def minimize(self):
-            window.minimize()
+        class WindowApi:
+            """JS bridge for the frameless window controls."""
+            def minimize(self):
+                window.minimize()
 
-        def close_app(self):
-            window.destroy()
+            def close_app(self):
+                window.destroy()
 
-    window = webview.create_window(
-        title=f"{APP_NAME}",
-        url=f"https://127.0.0.1:{port}/desktop",
-        js_api=WindowApi(),
-        width=860,
-        height=600,
-        min_size=(460, 420),
-        resizable=True,
-        frameless=True,
-        easy_drag=False,
-        background_color="#0C1220",
-    )
+        window = webview.create_window(
+            title=f"{APP_NAME}",
+            url=f"https://127.0.0.1:{port}/desktop",
+            js_api=WindowApi(),
+            width=860,
+            height=600,
+            min_size=(460, 420),
+            resizable=True,
+            frameless=True,
+            easy_drag=False,
+            background_color="#0C1220",
+        )
 
-    def _exit_app():
-        tray.stop()
-        if fw_added:
-            net.remove_firewall_rules()  # graceful exit leaves no inbound rules behind
-        os._exit(0)
+        def _exit_app():
+            tray.stop()
+            if fw_created:
+                net.remove_firewall_rules(fw_created)  # leave no rules we created
+            os._exit(0)
 
-    tray = Tray(
-        png_path,
-        on_show=lambda: (window.show(), window.restore()),
-        on_exit=_exit_app,
-        on_mute_toggle=lambda: socketio.emit("toggle_mute", to="mobile"),
-    )
-    ctx.on_lang_change = tray.apply_language
-    ctx.on_mute_change = tray.set_muted
+        tray = Tray(
+            png_path,
+            on_show=lambda: (window.show(), window.restore()),
+            on_exit=_exit_app,
+            on_mute_toggle=lambda: socketio.emit("toggle_mute", to="mobile"),
+        )
+        ctx.on_lang_change = tray.apply_language
+        ctx.on_mute_change = tray.set_muted
 
-    def _watch_lock_socket():
-        """Second launches ping us to bring the window back."""
-        sock = net.get_lock_socket()
-        if sock is None:
-            return
-        while True:
-            try:
-                conn, _ = sock.accept()
-                try:
-                    data = conn.recv(16)
-                finally:
-                    conn.close()
-                if data.startswith(b"show"):
-                    try:
-                        window.show()
-                        window.restore()
-                    except Exception:
-                        pass
-            except OSError:
+        def _watch_lock_socket():
+            """Second launches ping us to bring the window back."""
+            sock = net.get_lock_socket()
+            if sock is None:
                 return
+            while True:
+                try:
+                    conn, _ = sock.accept()
+                    try:
+                        data = conn.recv(16)
+                    finally:
+                        conn.close()
+                    if data.startswith(b"show"):
+                        try:
+                            window.show()
+                            window.restore()
+                        except Exception:
+                            pass
+                except OSError:
+                    return
 
-    window.events.minimized += lambda: window.hide()
-    window.events.closed += _exit_app
-    threading.Thread(target=_watch_lock_socket, daemon=True).start()
+        window.events.minimized += lambda: window.hide()
+        window.events.closed += _exit_app
+        threading.Thread(target=_watch_lock_socket, daemon=True).start()
 
-    tray.apply_language(settings.get("lang", "auto"))
-    tray.start()
+        tray.apply_language(settings.get("lang", "auto"))
+        tray.start()
 
-    webview.start(gui=platform.gui_backend, icon=icon_path if os.path.exists(icon_path) else None)
-    _exit_app()
+        webview.start(gui=platform.gui_backend, icon=icon_path if os.path.exists(icon_path) else None)
+        _exit_app()
+    except Exception as e:
+        _rollback_startup()
+        _alert(APP_NAME, f"{APP_NAME} failed to start:\n{e}")
+        return

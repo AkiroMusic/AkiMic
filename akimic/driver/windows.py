@@ -22,10 +22,10 @@ from .base import BasePlatform
 
 _SETUP_EXE = "VBCABLE_Setup_x64.exe"
 _UNINSTALLER_PATH = r"C:\Program Files\VB\CABLE\VBCABLE_Setup_x64.exe"
-# The VB-CABLE author's certificate CN (Vincent Burel / VB-Audio). Pinned by
-# name — thumbprints rotate on cert renewal; a mismatch here must stop the
-# elevated install.
-_EXPECTED_SIGNER_CN = "BUREL VINCENT"
+# The VB-CABLE author's certificate CN (Vincent Burel / VB-Audio), compared
+# EXACTLY via X.500 SimpleName — thumbprints rotate on cert renewal, so the
+# CN is the stable pin. A mismatch must stop the elevated install.
+_EXPECTED_SIGNER_CN = "BUREL VINCENT Entrepreneur individuel"
 
 # Registry property keys of an audio endpoint's PropertyStore.
 _PKEY_FMT = "{a45c254e-df1c-4efd-8020-67d146a850e0}"
@@ -132,27 +132,36 @@ def _authenticode_check(path: str) -> tuple[bool, str]:
     """Fail-closed signature + publisher verification.
 
     Returns (ok, message). Only a Valid signature by the expected VB-Audio
-    signer passes; NotSigned, NotTrusted, HashMismatch, UnknownError, empty
-    output and PowerShell failures all block the elevated install.
+    CN passes; NotSigned, NotTrusted, HashMismatch, UnknownError, empty
+    output and PowerShell failures all block the elevated install. The file
+    path travels through an environment variable — never interpolated into
+    the PowerShell command text — so a crafted TEMP path cannot inject
+    commands into this elevated process.
     """
     try:
+        env = {**os.environ, "AKIMIC_SIGN_PATH": path}
         proc = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
-             f"$s = Get-AuthenticodeSignature -LiteralPath '{path}'; "
-             "Write-Output $s.Status; Write-Output $s.SignerCertificate.Subject"],
+             "$s = Get-AuthenticodeSignature -LiteralPath $env:AKIMIC_SIGN_PATH; "
+             "if ($null -eq $s) { Write-Output 'LoadError'; Write-Output '' } "
+             "else { "
+             "Write-Output $s.Status; "
+             "Write-Output $s.SignerCertificate.GetNameInfo("
+             "[System.Security.Cryptography.X509Certificates.X500NameFormat]::SimpleName, $false) }"],
             capture_output=True, text=True, timeout=60,
             creationflags=subprocess.CREATE_NO_WINDOW,
+            env=env,
         )
         if proc.returncode != 0:
             return False, f"signature check failed (powershell exit {proc.returncode})"
         lines = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
-        status = lines[0] if lines else ""
-        subject = lines[1] if len(lines) > 1 else ""
+        status = lines[0] if lines else "UnknownError"
+        cn = lines[1] if len(lines) > 1 else ""
         if status != "Valid":
             return False, f"driver binary signature status: {status} — install aborted"
-        if _EXPECTED_SIGNER_CN.lower() not in subject.lower():
-            return False, f"driver binary signed by unexpected publisher: {subject[:80]}"
-        return True, f"signed by {subject[:60]}"
+        if cn.lower() != _EXPECTED_SIGNER_CN.lower():
+            return False, f"driver binary signed by unexpected publisher: {cn or '(none)'}"
+        return True, f"signed by {cn}"
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, f"signature check failed: {e}"
 
