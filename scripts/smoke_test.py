@@ -1,5 +1,8 @@
 """Smoke test: boot the real server (no webview) and hit every endpoint.
 
+Fully isolated: settings live in a temp dir, so the developer's real
+settings.json is never read, written, or deleted.
+
 Run: .venv/Scripts/python scripts/smoke_test.py
 """
 
@@ -7,13 +10,14 @@ import json
 import os
 import ssl
 import sys
+import tempfile
 import time
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from akimic.driver import get_platform
-from akimic.net import find_free_port, get_lan_ip
+from akimic.net import find_free_port
 from akimic.server import ServerContext, start_server_thread
 from akimic.settings import Settings
 
@@ -31,9 +35,11 @@ def fetch(url):
 
 def main():
     port = find_free_port(5300, 5400)  # stay clear of the real app range
-    ctx = ServerContext(settings=Settings(), platform=get_platform(), port=port, lan_ip="127.0.0.1")
-    start_server_thread(ctx)
-    time.sleep(2.0)
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = ServerContext(settings=Settings(base_dir=tmp), platform=get_platform(),
+                            port=port, lan_ip="127.0.0.1")
+        start_server_thread(ctx)
+        time.sleep(2.0)
 
     base = f"https://127.0.0.1:{port}"
     checks = [
@@ -99,10 +105,6 @@ def main():
 
     print(f"\n{'ALL OK' if failures == 0 else f'{failures} FAILURES'}")
     sys.stdout.flush()
-    try:
-        os.remove(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "settings.json"))
-    except OSError:
-        pass
     os._exit(0 if failures == 0 else 1)
 
 

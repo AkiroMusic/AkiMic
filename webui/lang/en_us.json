@@ -57,7 +57,7 @@
   "m_denied_desc": "Allow microphone access for this page in your browser settings, then tap retry.",
   "m_ok": "OK",
   "m_gain": "Gain",
-  "m_rtt": "RTT",
+  "m_rtt": "Latency",
 
   "tray_show": "Show AkiMic",
   "tray_exit": "Exit",

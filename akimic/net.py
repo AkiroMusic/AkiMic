@@ -2,8 +2,10 @@
 
 import ipaddress
 import socket
+import ssl
 import subprocess
 import sys
+import time
 
 PORT_RANGE_START = 5000
 PORT_RANGE_END = 5100
@@ -28,7 +30,22 @@ def _is_usable_lan_ip(ip: str) -> bool:
 
 
 def get_lan_ip() -> str:
-    """Return this machine's LAN IPv4, robust against TUN adapters."""
+    """Return this machine's LAN IPv4, robust against TUN adapters.
+
+    The default-route interface is tried first (the one phones on the same
+    LAN actually reach), then hostname-resolution candidates; proxy-TUN
+    fake IPs (198.18.0.0/15) are excluded throughout.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        ip = s.getsockname()[0]
+        if _is_usable_lan_ip(ip):
+            return ip
+    except OSError:
+        pass
+    finally:
+        s.close()
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
             ip = info[4][0]
@@ -36,16 +53,26 @@ def get_lan_ip() -> str:
                 return ip
     except OSError:
         pass
-    # fallback: routing-table trick (no packets actually sent)
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("10.255.255.255", 1))
-        ip = s.getsockname()[0]
-        return ip if _is_usable_lan_ip(ip) else "127.0.0.1"
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        s.close()
+    return "127.0.0.1"
+
+
+def wait_server_ready(port: int, timeout: float = 10.0) -> tuple[bool, str]:
+    """Poll until the HTTPS signaling server answers on loopback."""
+    deadline = time.time() + timeout
+    verify_off = ssl.create_default_context()
+    verify_off.check_hostname = False
+    verify_off.verify_mode = ssl.CERT_NONE
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.5) as raw:
+                try:
+                    with verify_off.wrap_socket(raw):
+                        return True, "ready"
+                except (ssl.SSLError, OSError):
+                    return False, "port is open but TLS handshake failed (port taken by another service?)"
+        except OSError:
+            time.sleep(0.3)
+    return False, f"server did not become ready within {timeout:.0f}s"
 
 
 def find_free_port(start: int = PORT_RANGE_START, end: int = PORT_RANGE_END) -> int:
@@ -104,44 +131,59 @@ def _netsh(args: list[str]) -> tuple[int, str]:
         return 1, str(e)
 
 
+def _rule_exists(name: str) -> bool:
+    code, out = _netsh(["show", "rule", f"name={name}"])
+    return code == 0 and name in out and "No rules match" not in out
+
+
 def ensure_firewall_rules() -> tuple[bool, str]:
     """Allow phone→PC traffic: TCP 5000-5100 for the signaling server and
     UDP ephemeral ports for WebRTC ICE (WebView2 binds them when the phone
-    connects — without this Windows pops the security alert every
+    connects — without this Windows pops the security alert on every
     connection, and cancelling it blocks the audio stream entirely).
-    Both rules are scoped to the local subnet. Recreated each boot so
-    definition upgrades apply cleanly; needs elevation.
+    Both rules are scoped to the local subnet. Per-rule idempotent, so a
+    partial previous run is completed rather than wiped and rebuilt.
     """
     if sys.platform != "win32":
         return True, "firewall management is Windows-only, skipped"
 
-    for name in (FIREWALL_RULE_NAME, FIREWALL_RULE_ICE):
-        _netsh(["delete", "rule", f"name={name}"])  # ignore "not found"
-
-    code, out = _netsh([
-        "add", "rule", f"name={FIREWALL_RULE_NAME}",
-        "dir=in", "action=allow", "protocol=TCP",
-        f"localport={PORT_RANGE_START}-{PORT_RANGE_END}",
-        "remoteip=localsubnet",
-        "description=AkiMic LAN signaling",
-    ])
-    if code != 0:
-        return False, out.strip()
-    code, out = _netsh([
-        "add", "rule", f"name={FIREWALL_RULE_ICE}",
-        "dir=in", "action=allow", "protocol=UDP",
-        "localport=49152-65535",
-        "remoteip=localsubnet",
-        "description=AkiMic WebRTC ICE connectivity checks",
-    ])
-    return code == 0, out.strip() or "rules added"
+    rules = (
+        (FIREWALL_RULE_NAME, "TCP", f"{PORT_RANGE_START}-{PORT_RANGE_END}", "AkiMic LAN signaling"),
+        (FIREWALL_RULE_ICE, "UDP", "49152-65535", "AkiMic WebRTC ICE connectivity checks"),
+    )
+    ok = True
+    parts = []
+    for name, proto, port, desc in rules:
+        if _rule_exists(name):
+            parts.append(f"{proto}: present")
+            continue
+        code, out = _netsh([
+            "add", "rule", f"name={name}",
+            "dir=in", "action=allow", f"protocol={proto}",
+            f"localport={port}",
+            "remoteip=localsubnet",
+            f"description={desc}",
+        ])
+        if code == 0:
+            parts.append(f"{proto}: added")
+        else:
+            ok = False
+            parts.append(f"{proto}: FAILED ({out.strip()[:80]})")
+    return ok, "; ".join(parts)
 
 
 def remove_firewall_rules() -> tuple[bool, str]:
+    """Remove AkiMic's rules; missing rules count as success (idempotent)."""
     if sys.platform != "win32":
         return True, "skipped"
     ok = True
+    removed = 0
     for name in (FIREWALL_RULE_NAME, FIREWALL_RULE_ICE):
-        code, out = _netsh(["delete", "rule", f"name={name}"])
-        ok = ok and code == 0
-    return ok, out.strip() or "rules removed"
+        if not _rule_exists(name):
+            continue
+        code, _out = _netsh(["delete", "rule", f"name={name}"])
+        if code == 0:
+            removed += 1
+        else:
+            ok = False
+    return ok, (f"removed {removed}" if removed else "none present")

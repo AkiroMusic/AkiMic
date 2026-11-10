@@ -9,6 +9,7 @@ const S = {
   stream: null, audioCtx: null, source: null, gainNode: null,
   analyser: null, vuBuf: null, dest: null,
   rafId: 0, statsTimer: 0, retryTimer: 0, lastAttempt: 0, rttEma: null,
+  pendingIce: [],
   mode: 'idle',            // idle | live | muted
   pcState: 'new',
   wakeLock: null,
@@ -32,6 +33,12 @@ async function loadLang(code) {
     });
     $('lang-label').textContent = code === 'zh_cn' ? 'EN' : '中';
     updateUI();
+    // persist the shared language preference (same key the desktop uses)
+    fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ lang: code }),
+    }).catch(() => {});
   } catch (e) { console.warn('lang load failed', e); }
 }
 
@@ -125,6 +132,7 @@ function closePc() {
   if (S.pc) { try { S.pc.close(); } catch (e) {} S.pc = null; }
   clearInterval(S.statsTimer); S.statsTimer = 0;
   S.rttEma = null;
+  S.pendingIce = [];
 }
 
 async function startStreaming() {
@@ -140,6 +148,7 @@ async function startStreaming() {
   closePc();
   const pc = new RTCPeerConnection(rtcConfig);
   S.pc = pc;
+  S.pendingIce = [];
   S.pcState = 'new';
 
   pc.onicecandidate = (ev) => { if (ev.candidate) S.socket.emit('ice_candidate', ev.candidate); };
@@ -218,8 +227,9 @@ async function startMic() {
   analyser.fftSize = 512;
   const dest = ctx.createMediaStreamDestination();
 
-  const initial = parseFloat($('gain-slider').value) || 1;
-  gain.gain.value = initial;
+  // 0 must stay 0 (a saved gain of zero is valid) — no falsy-coalescing here
+  const saved = parseFloat($('gain-slider').value);
+  gain.gain.value = Number.isFinite(saved) ? saved : 1;
 
   source.connect(gain);
   gain.connect(analyser);
@@ -235,6 +245,12 @@ async function startMic() {
   startStreaming().catch(() => scheduleRestart());
 }
 
+function reportMuteState() {
+  if (S.socket && S.socket.connected) {
+    S.socket.emit('mute_state', { muted: S.mode === 'muted' });
+  }
+}
+
 function toggleMic() {
   if (S.mode === 'idle') {
     startMic();
@@ -243,12 +259,14 @@ function toggleMic() {
     if (S.gainNode) S.gainNode.gain.value = 0;
     releaseWakeLock();
     updateUI();
+    reportMuteState();
   } else {
     S.mode = 'live';
     if (S.audioCtx && S.audioCtx.state === 'suspended') S.audioCtx.resume().catch(() => {});
     if (S.gainNode) S.gainNode.gain.value = parseFloat($('gain-slider').value);
     acquireWakeLock();
     updateUI();
+    reportMuteState();
     if (S.pcState !== 'connected') scheduleRestart();
   }
 }
@@ -262,6 +280,7 @@ function connectSocket() {
   socket.on('connect', () => {
     socket.emit('join', { role: 'mobile' });
     updateUI();
+    reportMuteState();
     if (S.mode !== 'idle' && S.pcState !== 'connected') {
       startStreaming().catch(() => scheduleRestart());
     }
@@ -272,12 +291,22 @@ function connectSocket() {
   socket.on('answer', async (data) => {
     // ignore stale/duplicate answers (reconnects can race old peers)
     if (!S.pc || S.pc.signalingState !== 'have-local-offer') return;
-    try { await S.pc.setRemoteDescription(new RTCSessionDescription(data)); }
-    catch (e) { scheduleRestart(); }
+    try {
+      await S.pc.setRemoteDescription(new RTCSessionDescription(data));
+      // candidates queued while the remote description was pending
+      const queued = S.pendingIce.splice(0);
+      for (const c of queued) {
+        try { await S.pc.addIceCandidate(new RTCIceCandidate(c)); }
+        catch (e) { /* stale or invalid candidate */ }
+      }
+    } catch (e) { scheduleRestart(); }
   });
 
   socket.on('ice_candidate', (data) => {
-    if (S.pc) S.pc.addIceCandidate(new RTCIceCandidate(data)).catch(() => {});
+    const pc = S.pc;
+    if (!pc || pc.signalingState === 'closed') return;
+    if (!pc.remoteDescription) { S.pendingIce.push(data); return; }
+    pc.addIceCandidate(new RTCIceCandidate(data)).catch(() => {});
   });
 
   socket.on('toggle_mute', () => {

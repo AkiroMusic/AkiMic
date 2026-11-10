@@ -147,10 +147,10 @@ class WindowsPlatform(BasePlatform):
     def _get_default_playback_id(self) -> str:
         return _run_ps(_PS_GET_DEFAULT, timeout=30) or ""
 
-    def _set_default_playback(self, device_id: str) -> None:
+    def _set_default_playback(self, device_id: str) -> bool:
         if not device_id:
-            return
-        _run_ps(_PS_SET_DEFAULT.replace("{__DEVICE_ID__}", device_id), timeout=30)
+            return False
+        return _run_ps(_PS_SET_DEFAULT.replace("{__DEVICE_ID__}", device_id), timeout=30) is not None
 
     def _driver_zip_path(self) -> str:
         if getattr(sys, "frozen", False):
@@ -161,29 +161,14 @@ class WindowsPlatform(BasePlatform):
 
     # --- BasePlatform ----------------------------------------------------
 
-    # Registry traces the official VB-CABLE driver always leaves behind;
-    # the device list can lag a fresh install or hide a disabled endpoint.
-    _REGISTRY_TRACES = (
-        r"SYSTEM\CurrentControlSet\Services\VBCABLE",
-        r"SOFTWARE\VB-Audio\Cable",
-        r"SOFTWARE\WOW6432Node\VB-Audio\Cable",
-    )
-
     def _cable_in_sound_devices(self) -> bool:
         return any(name == "VB-Audio Virtual Cable" for name in self._sound_devices())
 
     def is_driver_installed(self) -> bool:
-        # Exact match on the cable entry; "VB-Audio Voicemeeter VAIO" must not match.
-        if self._cable_in_sound_devices():
-            return True
-        for path in self._REGISTRY_TRACES:
-            try:
-                winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path, 0,
-                               winreg.KEY_READ | winreg.KEY_WOW64_64KEY).Close()
-                return True
-            except OSError:
-                continue
-        return False
+        """True only when the real audio device is enumerable. Registry traces
+        alone mean the package is present but the endpoint may be missing or
+        disabled — that state must not pass as "installed"."""
+        return self._cable_in_sound_devices()
 
     def _wait_for_device(self, timeout_s: int = 20) -> bool:
         """Poll until the virtual device shows up after the installer exits."""
@@ -251,6 +236,17 @@ class WindowsPlatform(BasePlatform):
             return False, "driver package missing: " + zip_path
 
         old_default = self._get_default_playback_id()
+        ok, msg = False, ""
+        try:
+            ok, msg = self._run_installer(zip_path)
+        finally:
+            # the vendor installer may promote itself to default speaker even
+            # when it fails — restore the previous device on every outcome
+            if old_default and not self._set_default_playback(old_default):
+                msg = (msg or "") + " (warning: could not restore the previous default speaker)"
+        return ok, msg
+
+    def _run_installer(self, zip_path: str) -> tuple[bool, str]:
         temp_dir = tempfile.mkdtemp(prefix="akimic_")
         try:
             with zipfile.ZipFile(zip_path, "r") as zf:
@@ -282,9 +278,6 @@ class WindowsPlatform(BasePlatform):
 
             if not self._wait_for_device():
                 return False, "installer finished but the device did not appear (try again or reboot)"
-
-            if old_default:
-                self._set_default_playback(old_default)
             return True, "installed"
         except Exception as e:
             return False, f"install error: {e}"

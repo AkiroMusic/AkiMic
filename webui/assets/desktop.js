@@ -10,6 +10,7 @@ const S = {
   audioCtx: null, gainNode: null, analyser: null, vuBuf: null, pumpEl: null,
   rafId: 0, statsTimer: 0, statsLevel: 0,
   rttEma: null, lossEma: null, lastLost: null, lastRecv: null,
+  streamId: null, pendingIce: [],
   muted: false, playing: false, phoneHere: false,
   devices: [], selectedDevice: 'default', micLabel: '',
 };
@@ -243,8 +244,10 @@ async function loadDevices() {
 }
 
 async function applySink() {
-  if (!S.audioCtx || !S.selectedDevice || S.selectedDevice === 'default'
-      || typeof S.audioCtx.setSinkId !== 'function') return false;
+  if (!S.audioCtx || !S.selectedDevice || S.selectedDevice === 'default') {
+    return true;  // system default routing: nothing explicit to set
+  }
+  if (typeof S.audioCtx.setSinkId !== 'function') return false;  // unsupported
   try {
     await S.audioCtx.setSinkId(S.selectedDevice);
     return true;
@@ -262,14 +265,19 @@ async function applySink() {
 
 /* ---------- WebRTC ---------- */
 
-function teardownAudio() {
+/* Dispose the audio graph only — MUST NOT touch the PeerConnection.
+   The PC that fired ontrack is mid-negotiation here; closing it would kill
+   the connection right as the answer goes out (the old "connected but no
+   audio" root cause). PC lifecycle belongs to the offer handler and
+   peer_left. */
+function disposeAudioGraph() {
   if (S.rafId) { cancelAnimationFrame(S.rafId); S.rafId = 0; }
   clearInterval(S.statsTimer); S.statsTimer = 0;
-  if (S.pc) { try { S.pc.close(); } catch (e) {} S.pc = null; }
   if (S.pumpEl) { try { S.pumpEl.srcObject = null; } catch (e) {} S.pumpEl = null; }
   if (S.audioCtx) { try { S.audioCtx.close(); } catch (e) {} S.audioCtx = null; }
-  S.gainNode = null; S.analyser = null;
+  S.gainNode = null; S.analyser = null; S.vuBuf = null;
   S.playing = false;
+  S.streamId = null;
   S.statsLevel = 0;
   S.rttEma = null; S.lossEma = null; S.lastLost = null; S.lastRecv = null;
   $('rtt-value').textContent = '—';
@@ -277,8 +285,21 @@ function teardownAudio() {
   updateMicUI();
 }
 
+function closePeer() {
+  S.pendingIce = [];
+  if (S.pc) { try { S.pc.close(); } catch (e) {} S.pc = null; }
+}
+
+/* Full teardown: the phone is gone or the app is ending. */
+function fullTeardown() {
+  closePeer();
+  disposeAudioGraph();
+}
+
 function setupPipeline(stream) {
-  teardownAudio();
+  if (!stream) return;
+  if (S.playing && S.streamId === stream.id) return;  // duplicate ontrack
+  disposeAudioGraph();
 
   // Chromium quirk: a remote WebRTC stream only reliably feeds WebAudio when
   // something "consumes" the track. A muted element keeps the pipeline alive
@@ -302,6 +323,7 @@ function setupPipeline(stream) {
 
   S.audioCtx = ctx; S.gainNode = gain; S.analyser = analyser;
   S.vuBuf = new Uint8Array(analyser.fftSize);
+  S.streamId = stream.id;
   S.playing = true;
 
   applySink().then((routed) => {
@@ -310,15 +332,16 @@ function setupPipeline(stream) {
   if (ctx.state === 'suspended') ctx.resume().catch(() => {});
   updateMicUI();
   vuLoop();
-  startStatsLoop();
+  startStatsLoop(S.pc);
 }
 
-function startStatsLoop() {
+function startStatsLoop(pc) {
   clearInterval(S.statsTimer);
   S.statsTimer = setInterval(async () => {
-    if (!S.pc) return;
+    // stats only from the connection that is still current
+    if (!pc || pc !== S.pc || pc.connectionState === 'closed') return;
     try {
-      const stats = await S.pc.getStats();
+      const stats = await pc.getStats();
       let rtt = null;
       let jitterMs = null;
       let audioLevel = 0;
@@ -357,13 +380,26 @@ function startStatsLoop() {
   }, 1000);
 }
 
+async function flushIce(pc) {
+  const queued = S.pendingIce.splice(0);
+  for (const c of queued) {
+    try { await pc.addIceCandidate(new RTCIceCandidate(c)); }
+    catch (e) { /* stale or invalid candidate for this session */ }
+  }
+}
+
 async function handleOffer(offer) {
-  if (S.pc) { try { S.pc.close(); } catch (e) {} }
+  closePeer();          // old PC (if any) goes here…
+  disposeAudioGraph();  // …and the old audio graph with it
   const pc = new RTCPeerConnection(rtcConfig);
   S.pc = pc;
+  S.pendingIce = [];
 
   pc.onicecandidate = (ev) => { if (ev.candidate) S.socket.emit('ice_candidate', ev.candidate); };
-  pc.ontrack = (ev) => { setupPipeline(ev.streams[0]); };
+  pc.ontrack = (ev) => {
+    const stream = ev.streams && ev.streams[0] ? ev.streams[0] : new MediaStream([ev.track]);
+    setupPipeline(stream);
+  };
   pc.onconnectionstatechange = () => {
     if (!S.phoneHere) return;
     if (pc.connectionState === 'connected') setStreamPill(S.muted ? 'muted' : 'live');
@@ -373,6 +409,8 @@ async function handleOffer(offer) {
   };
 
   await pc.setRemoteDescription(new RTCSessionDescription(offer));
+  // candidates queued while the remote description was pending
+  await flushIce(pc);
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
   S.socket.emit('answer', answer);
@@ -398,13 +436,25 @@ function connectSocket() {
     setPhonePill('bad');
     $('phone-pill-text').textContent = t('d_status_reconnect');
     showWaitPanel(true);
-    teardownAudio();
+    fullTeardown();
   });
 
   socket.on('offer', (data) => handleOffer(data).catch((e) => console.warn('offer failed', e)));
 
   socket.on('ice_candidate', (data) => {
-    if (S.pc) S.pc.addIceCandidate(new RTCIceCandidate(data)).catch(() => {});
+    const pc = S.pc;
+    if (!pc || pc.signalingState === 'closed') return;
+    if (!pc.remoteDescription) { S.pendingIce.push(data); return; }
+    pc.addIceCandidate(new RTCIceCandidate(data)).catch(() => {});
+  });
+
+  socket.on('room_state', (data) => {
+    // snapshot for a freshly opened page: the phone may already be waiting
+    if (!data || !data.mobile_online || S.phoneHere) return;
+    S.phoneHere = true;
+    setPhonePill('good');
+    $('phone-pill-text').textContent = t('d_status_connected');
+    showWaitPanel(false);
   });
 }
 

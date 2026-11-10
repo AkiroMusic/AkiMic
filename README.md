@@ -30,7 +30,7 @@ AkiMic is a personal rewrite inspired by [ZeroMic](https://github.com/hypixice/Z
 
 - **One-click flow** — launch, and everything else is automatic: driver check (silent install on first run), firewall rules (TCP signaling + UDP ICE, LAN-only, no Windows security popups), persistent certificate trusted by the PC, QR pairing, device matching, default-speaker protection.
 - **Aurora Dusk UI** — built on the Aki Design System, flat rendering: Aurora Dusk palette, clean panels, 4 switchable color packs, real RMS level meters, round-trip latency readout. Freely resizable window.
-- **Auto-reconnect** — the phone re-negotiates WebRTC automatically after lock screen, backgrounding, or Wi-Fi hiccups; the desktop resets cleanly when the phone leaves.
+- **Auto-reconnect** — the phone page automatically re-negotiates WebRTC when it wakes up (returning from lock screen / background) and after Wi-Fi hiccups; the desktop resets cleanly when the phone leaves. iOS may require bringing the page back to the foreground.
 - **Persistent settings** — language, theme, gains and output device are saved next to the exe (`settings.json`), portable-style.
 - **System tray** — minimize to tray; mute from the tray; single-instance guard.
 
@@ -128,7 +128,7 @@ AkiMic 参考开源项目 [ZeroMic](https://github.com/hypixice/ZeroMic)（GPL-3
 
 - **一键流程**——启动后全自动：驱动检测（首跑静默安装）、防火墙放行（TCP 信令 + UDP ICE，仅限局域网，不再弹安全警报）、持久化证书受电脑信任、扫码配对、设备自动匹配、默认扬声器保护恢复。
 - **Aurora Dusk 界面**——基于 Aki 设计系统、平面化渲染：Aurora Dusk 配色、干净面板、4 套可切换配色、真实 RMS 电平表、往返延迟显示。窗口自由缩放。
-- **自动重连**——手机锁屏 / 切后台 / Wi-Fi 抖动后自动重建 WebRTC；手机离开时桌面端干净复位。
+- **自动重连**——手机页面唤醒（锁屏 / 切后台返回）或 Wi-Fi 抖动后自动重建 WebRTC；手机离开时桌面端干净复位。iOS 可能需要手动切回页面。
 - **设置持久化**——语言、主题、增益、输出设备保存在 exe 旁（`settings.json`），绿色便携。
 - **系统托盘**——最小化到托盘，托盘可静音，单实例保护。
 

@@ -8,7 +8,6 @@ import ctypes
 import os
 import sys
 import threading
-import time
 
 from . import APP_NAME, __version__, certs, net
 from .driver import get_platform
@@ -76,7 +75,15 @@ def run() -> None:
     ctx = ServerContext(settings=settings, platform=platform, port=port, lan_ip=lan_ip,
                         fw_ok=fw_ok, ssl_cert=ssl_cert, ssl_key=ssl_key)
     socketio = start_server_thread(ctx)
-    time.sleep(1.0)  # give HTTPS a moment before the window loads it
+    # confirm the HTTPS server is actually listening (never a blind sleep)
+    ready, ready_msg = net.wait_server_ready(port, timeout=10)
+    if not ready:
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                0, f"{APP_NAME} server failed to start:\n{ready_msg}", APP_NAME, 0x10)
+        except Exception:
+            print(f"[{APP_NAME}] {ready_msg}")
+        return
 
     icon_path = os.path.join(base_path, "assets", "icon.ico")
     png_path = os.path.join(base_path, "assets", "icon.png")
@@ -106,6 +113,7 @@ def run() -> None:
 
     def _exit_app():
         tray.stop()
+        net.remove_firewall_rules()  # graceful exit leaves no inbound rules behind
         os._exit(0)
 
     tray = Tray(

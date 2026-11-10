@@ -1,11 +1,18 @@
 """Flask + SocketIO server: static web UI, REST API and WebRTC signaling.
 
-Signaling model: two roles ("mobile" and "desktop") each join their own
-room. SDP offers / answers / ICE candidates are forwarded to the opposite
-room only, and peer_left is broadcast when a side drops so the UI can reset.
-Origin is allow-listed to this machine's own addresses so third-party
-websites cannot inject audio into the virtual microphone; the desktop slot
-is single (a newer page replaces an older one) and mobile senders are capped.
+Security model:
+- Management REST endpoints (driver install/uninstall, exit, lang, desktop
+  mute sync, full settings writes) are loopback-only — the phone may only
+  write its own gain and the shared language.
+- The desktop page always loads via 127.0.0.1, so its requests originate
+  from loopback and pass automatically.
+- Signaling: the desktop slot is single (a newer page replaces an older
+  one), only ONE mobile sender is accepted, and SDP/ICE is unicast between
+  the exact peer SIDs — never broadcast into shared rooms. Role checks are
+  enforced per event: only a joined mobile may send offers, only the
+  desktop may send answers.
+
+The audio itself never passes through here; this is control-plane only.
 """
 
 import os
@@ -23,7 +30,10 @@ from .settings import Settings
 
 WEBUI_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webui")
 
-MAX_MOBILE_SENDERS = 4
+# One phone is the product: a second sender gets an explicit busy instead of
+# sharing the desktop with another stream (which would also crosstalk answers).
+MAX_MOBILE_SENDERS = 1
+_MAX_SDP_LEN = 65536
 
 
 class ServerContext:
@@ -39,7 +49,17 @@ class ServerContext:
         self.ssl_cert = ssl_cert
         self.ssl_key = ssl_key
         self.on_lang_change = None   # callable(lang_code)
-        self.on_mute_change = None   # callable(muted: bool)
+        self.on_mute_change = None   # callable(muted: bool) — phone source mute
+
+
+def _is_loopback() -> bool:
+    return (request.remote_addr or "") in ("127.0.0.1", "::1")
+
+
+def _json_object():
+    """Parsed JSON body if it is an object, else None."""
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else None
 
 
 def _origin_allowed(origin: str | None, ctx: ServerContext) -> bool:
@@ -68,6 +88,7 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
 
     sid_role: dict[str, str] = {}
     desktop_sid: str | None = None
+    active_offer_sid: str | None = None  # the mobile currently negotiating
 
     # ---- static pages ----------------------------------------------------
 
@@ -118,17 +139,26 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
     @app.route("/api/settings", methods=["GET", "POST"])
     def api_settings():
         if request.method == "POST":
-            patch = request.get_json(silent=True) or {}
+            patch = _json_object()
+            if patch is None:
+                return jsonify({"error": "expected a JSON object"}), 400
+            if not _is_loopback():
+                # phones may only touch their own gain and the shared language
+                patch = {k: v for k, v in patch.items() if k in ("mobile_gain", "lang")}
             ctx.settings.update(patch)
         return jsonify(ctx.settings.as_dict())
 
     @app.route("/api/driver/install", methods=["POST"])
     def api_driver_install():
+        if not _is_loopback():
+            return jsonify({"error": "local only"}), 403
         ok, msg = ctx.platform.install_driver()
         return jsonify({"success": ok, "msg": msg})
 
     @app.route("/api/driver/uninstall", methods=["POST"])
     def api_driver_uninstall():
+        if not _is_loopback():
+            return jsonify({"error": "local only"}), 403
         ok, msg = ctx.platform.uninstall_driver()
         if ok:
             from . import net
@@ -137,20 +167,29 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
 
     @app.route("/api/lang", methods=["POST"])
     def api_lang():
-        lang = (request.get_json(silent=True) or {}).get("lang", "en_us")
+        if not _is_loopback():
+            return jsonify({"error": "local only"}), 403
+        data = _json_object()
+        if data is None:
+            return jsonify({"error": "expected a JSON object"}), 400
+        lang = data.get("lang", "en_us")
         if ctx.on_lang_change:
             ctx.on_lang_change(lang)
         return jsonify({"success": True})
 
     @app.route("/api/mute", methods=["POST"])
     def api_mute():
-        muted = bool((request.get_json(silent=True) or {}).get("muted", False))
-        if ctx.on_mute_change:
-            ctx.on_mute_change(muted)
+        # desktop-page playback-mute sync; the tray follows the PHONE source
+        # mute via the mute_state socket event instead
+        if not _is_loopback():
+            return jsonify({"error": "local only"}), 403
         return jsonify({"success": True})
 
     @app.route("/api/exit", methods=["POST"])
     def api_exit():
+        if not _is_loopback():
+            return jsonify({"error": "local only"}), 403
+
         def _quit():
             time.sleep(0.8)
             os._exit(0)
@@ -161,57 +200,95 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
 
     @socketio.on("join")
     def on_join(data):
-        nonlocal desktop_sid
+        nonlocal desktop_sid, active_offer_sid
+        if not isinstance(data, dict) or request.sid in sid_role:
+            return  # malformed or already joined (no role switching)
         role = data.get("role", "unknown")
         if role not in ("mobile", "desktop"):
             return
-        if role == "desktop" and desktop_sid and desktop_sid != request.sid:
-            # single desktop slot: a newer page replaces a stale one
-            socketio.server.disconnect(desktop_sid, namespace="/")
-            desktop_sid = None
-        if role == "mobile":
-            mobile = [sid for sid, r in sid_role.items() if r == "mobile" and sid != request.sid]
-            if len(mobile) >= MAX_MOBILE_SENDERS:
-                emit("join_rejected", {"reason": "too_many_senders"})
+
+        if role == "desktop":
+            if desktop_sid and desktop_sid != request.sid:
+                # single desktop slot: a newer page replaces a stale one
+                socketio.server.disconnect(desktop_sid, namespace="/")
+            desktop_sid = request.sid
+        else:
+            others = sum(1 for sid, r in sid_role.items() if r == "mobile")
+            if others >= MAX_MOBILE_SENDERS:
+                emit("join_rejected", {"reason": "busy"})
                 return
+
         sid_role[request.sid] = role
         socketio.server.enter_room(request.sid, role)
-        if role == "desktop":
-            desktop_sid = request.sid
-        counterpart = "desktop" if role == "mobile" else "mobile"
-        socketio.emit("peer_joined", {"role": role}, to=counterpart)
+
+        # state snapshot so a freshly (re)opened page learns who is present
+        emit("room_state", {
+            "desktop_online": desktop_sid is not None,
+            "mobile_online": any(r == "mobile" for r in sid_role.values()),
+        })
 
     @socketio.on("disconnect")
     def on_disconnect():
-        nonlocal desktop_sid
+        nonlocal desktop_sid, active_offer_sid
         role = sid_role.pop(request.sid, None)
         if role == "desktop" and desktop_sid == request.sid:
             desktop_sid = None
+        if request.sid == active_offer_sid:
+            active_offer_sid = None
         if not role:
             return
         counterpart = "desktop" if role == "mobile" else "mobile"
         socketio.emit("peer_left", {"role": role}, to=counterpart)
 
-    def _relay(event: str, data, target_room: str) -> None:
-        emit(event, data, to=target_room)
+    def _valid_sdp(data) -> bool:
+        return (isinstance(data, dict)
+                and isinstance(data.get("sdp"), str)
+                and 0 < len(data["sdp"]) <= _MAX_SDP_LEN)
+
+    def _valid_candidate(data) -> bool:
+        return (isinstance(data, dict)
+                and isinstance(data.get("candidate"), str)
+                and len(data["candidate"]) <= 2048)
 
     @socketio.on("offer")
     def on_offer(data):
-        # offers originate from the phone
-        _relay("offer", data, "desktop")
+        nonlocal active_offer_sid
+        if sid_role.get(request.sid) != "mobile" or not _valid_sdp(data):
+            return
+        active_offer_sid = request.sid
+        if desktop_sid:
+            emit("offer", data, to=desktop_sid)
 
     @socketio.on("answer")
     def on_answer(data):
-        _relay("answer", data, "mobile")
+        if sid_role.get(request.sid) != "desktop" or not _valid_sdp(data):
+            return
+        if active_offer_sid:
+            emit("answer", data, to=active_offer_sid)
 
     @socketio.on("ice_candidate")
     def on_ice_candidate(data):
-        role = sid_role.get(request.sid, "mobile")
-        _relay("ice_candidate", data, "desktop" if role == "mobile" else "mobile")
+        role = sid_role.get(request.sid)
+        if not _valid_candidate(data):
+            return
+        if role == "mobile":
+            if desktop_sid:
+                emit("ice_candidate", data, to=desktop_sid)
+        elif role == "desktop":
+            if active_offer_sid:
+                emit("ice_candidate", data, to=active_offer_sid)
+
+    @socketio.on("mute_state")
+    def on_mute_state(data):
+        # phone source mute → tray label
+        if sid_role.get(request.sid) != "mobile" or not isinstance(data, dict):
+            return
+        if ctx.on_mute_change:
+            ctx.on_mute_change(bool(data.get("muted", False)))
 
     @socketio.on("toggle_mute")
     def on_toggle_mute():
-        # tray → phone
+        # tray → phone (the tray button toggles the phone source)
         socketio.emit("toggle_mute", to="mobile")
 
     return app, socketio
@@ -219,7 +296,8 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
 
 def start_server_thread(ctx: ServerContext) -> SocketIO:
     """Create the app and run it in a daemon thread; returns the SocketIO
-    instance so the caller can emit events (tray mute toggle, ...)."""
+    instance so the caller can emit events (tray mute toggle, ...).
+    Readiness is confirmed separately via net.wait_server_ready()."""
     app, socketio = create_server(ctx)
 
     def _run():

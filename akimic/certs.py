@@ -26,10 +26,10 @@ VALIDITY_DAYS = 825
 
 
 def ensure_cert(base_dir: str, lan_ip: str) -> tuple[str, str] | None:
-    """Return (cert_path, key_path), generating when missing or stale."""
+    """Return (cert_path, key_path), generating when missing, expired, or stale."""
     cert_path = os.path.join(base_dir, "cert.pem")
     key_path = os.path.join(base_dir, "key.pem")
-    if os.path.exists(cert_path) and os.path.exists(key_path) and _san_ok(cert_path, lan_ip):
+    if os.path.exists(cert_path) and os.path.exists(key_path) and _pair_ok(cert_path, key_path, lan_ip):
         return cert_path, key_path
     try:
         _generate(cert_path, key_path, lan_ip)
@@ -39,13 +39,25 @@ def ensure_cert(base_dir: str, lan_ip: str) -> tuple[str, str] | None:
         return None
 
 
-def _san_ok(cert_path: str, lan_ip: str) -> bool:
+def _pair_ok(cert_path: str, key_path: str, lan_ip: str) -> bool:
+    """Validity window + SAN coverage + certificate/private-key match."""
     try:
         with open(cert_path, "rb") as f:
             cert = x509.load_pem_x509_certificate(f.read())
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if now < cert.not_valid_before_utc or now > cert.not_valid_after_utc:
+            return False
         ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
         ips = {str(i) for i in ext.get_values_for_type(x509.IPAddress)}
-        return "127.0.0.1" in ips and str(lan_ip) in ips
+        if "127.0.0.1" not in ips or str(lan_ip) not in ips:
+            return False
+        with open(key_path, "rb") as f:
+            key = serialization.load_pem_private_key(f.read(), password=None)
+        cert_pub = cert.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+        key_pub = key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+        return cert_pub == key_pub
     except Exception:
         return False
 
@@ -77,14 +89,20 @@ def _generate(cert_path: str, key_path: str, lan_ip: str) -> None:
         .sign(key, hashes.SHA256())
     )
 
-    with open(key_path, "wb") as f:
+    # write to temp names first, then replace — a crash mid-write can no
+    # longer leave a cert/key pair that does not match
+    tmp_key = key_path + ".tmp"
+    tmp_cert = cert_path + ".tmp"
+    with open(tmp_key, "wb") as f:
         f.write(key.private_bytes(
             serialization.Encoding.PEM,
             serialization.PrivateFormat.PKCS8,
             serialization.NoEncryption(),
         ))
-    with open(cert_path, "wb") as f:
+    with open(tmp_cert, "wb") as f:
         f.write(cert.public_bytes(serialization.Encoding.PEM))
+    os.replace(tmp_key, key_path)
+    os.replace(tmp_cert, cert_path)
 
 
 def ensure_trusted(cert_path: str) -> bool:
