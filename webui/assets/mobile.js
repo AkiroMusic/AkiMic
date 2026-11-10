@@ -283,8 +283,9 @@ function reportMuteState() {
 }
 
 function toggleMic() {
-  if (S.joined !== true) {
-    // rejected (busy/bad pairing) or the desktop has not joined yet
+  if (S.joined !== true || !S.desktopOnline) {
+    // not accepted as mobile yet, or the desktop is not online: an offer
+    // sent now would be dropped server-side, so refuse to start
     $('mic-state').textContent = S.joined === 'rejected' ? t('m_busy') : t('m_wait_conn');
     return;
   }
@@ -336,11 +337,27 @@ function connectSocket() {
   });
 
   socket.on('peer_joined', (d) => {
-    if (d.role === 'desktop') { S.desktopOnline = true; updateUI(); }
+    if (d.role === 'desktop') {
+      S.desktopOnline = true;
+      updateUI();
+      // the desktop just came online while we're already capturing:
+      // (re)start the negotiation now or the original offer was dropped
+      if ((S.mode === 'live' || S.mode === 'muted') && S.pcState !== 'connected') {
+        startStreaming().catch(() => scheduleRestart());
+      }
+    }
   });
 
   socket.on('peer_left', (d) => {
     if (d.role === 'desktop') { S.desktopOnline = false; updateUI(); }
+  });
+
+  socket.on('disconnect', () => {
+    // signaling lost: joined/desktop state can no longer be trusted —
+    // a fresh room_state after reconnect restores them
+    S.joined = false;
+    S.desktopOnline = false;
+    updateUI();
   });
 
   socket.on('disconnect', () => { updateUI(); });

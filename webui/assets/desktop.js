@@ -10,7 +10,7 @@ const S = {
   audioCtx: null, gainNode: null, analyser: null, vuBuf: null, pumpEl: null,
   rafId: 0, statsTimer: 0, statsLevel: 0,
   rttEma: null, lossEma: null, lastLost: null, lastRecv: null,
-  streamId: null, pendingIce: [], pairUrl: '',
+  streamId: null, pendingIce: [], pairUrl: '', desktopToken: '', desktopJoined: false,
   muted: false, playing: false, phoneHere: false,
   devices: [], selectedDevice: 'default', micLabel: '',
 };
@@ -50,9 +50,14 @@ async function loadLang(code) {
 
 async function api(url, method = 'GET', body = null) {
   try {
+    const headers = {};
+    if (body) headers['Content-Type'] = 'application/json';
+    // per-run CSRF token: management POSTs require it, cross-origin pages
+    // cannot set custom headers without a preflight we never grant
+    if (S.desktopToken) headers['X-AkiMic-Token'] = S.desktopToken;
     const res = await fetch(url, {
       method,
-      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      headers,
       body: body ? JSON.stringify(body) : undefined,
     });
     return await res.json();
@@ -207,6 +212,7 @@ async function loadDevices() {
         probe = await navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => null);
       }
     }
+    if (probe) probe.getTracks().forEach((tr) => tr.stop());
     if (probe) probe.getTracks().forEach((tr) => tr.stop());
 
     devices = await navigator.mediaDevices.enumerateDevices();
@@ -425,7 +431,7 @@ function connectSocket() {
   const socket = io(window.location.origin, { reconnection: true, reconnectionDelay: 1000 });
   S.socket = socket;
 
-  socket.on('connect', () => socket.emit('join', { role: 'desktop' }));
+  socket.on('connect', () => joinDesktop());
 
   socket.on('peer_joined', (data) => {
     if (data.role !== 'mobile') return;
@@ -456,6 +462,8 @@ function connectSocket() {
   socket.on('room_state', (data) => {
     // authoritative snapshot: true connects, false resets stale state
     // (e.g. after our own socket reconnects while the phone is gone)
+    S.desktopJoined = true;
+    if (S.drawQr) S.drawQr();  // joined → safe to show the pairing QR now
     if (!data) return;
     if (data.mobile_online && !S.phoneHere) {
       S.phoneHere = true;
@@ -473,12 +481,19 @@ function connectSocket() {
 
   socket.on('disconnect', () => {
     // signaling lost: nothing about the phone state can be trusted anymore
+    S.desktopJoined = false;
     if (S.phoneHere) fullTeardown();
     S.phoneHere = false;
     setPhonePill('bad');
     $('phone-pill-text').textContent = t('d_status_reconnect');
     showWaitPanel(true);
   });
+
+  function joinDesktop() {
+    if (!S.desktopJoined && S.desktopToken) {
+      S.socket.emit('join', { role: 'desktop', token: S.desktopToken });
+    }
+  }
 }
 
 /* ---------- mute / gain ---------- */
@@ -551,9 +566,14 @@ async function init() {
   $('brand-ver').textContent = S.info.version || '';
   $('about-ver').textContent = S.info.version || '';
 
-  // the QR carries the per-run pairing secret — composed on loopback only
+  // pairing URL + desktop credential — loopback-only endpoint
   const pair = await api('/api/pair_url');
-  S.pairUrl = (pair && pair.url) || S.info.url || '';
+  if (pair && pair.url) {
+    S.pairUrl = pair.url;
+    S.desktopToken = pair.desktop_token || '';
+  } else {
+    S.pairUrl = S.info.url || '';
+  }
   $('url-text').textContent = S.pairUrl;
 
   applyTheme(S.settings.theme || 'dark');
@@ -563,13 +583,18 @@ async function init() {
     : S.settings.lang;
   await loadLang(lang);
 
+  // QR is drawn only once the socket has joined (authoritative room_state) —
+  // a QR shown before that could pair a phone with a half-ready desktop
   // QR (dark modules on white box, fixed for scanning contrast)
-  if (S.pairUrl) {
+  function drawQr() {
+    if (!S.pairUrl || $('qrcode').childElementCount) return;
     new QRCode($('qrcode'), {
       text: S.pairUrl, width: 150, height: 150,
       colorDark: '#0C1220', colorLight: '#ffffff', correctLevel: QRCode.CorrectLevel.H,
     });
   }
+  S.drawQr = drawQr;
+  if (S.socket && S.socket.connected) drawQr();
 
   // gain
   const savedGain = parseFloat(S.settings.desktop_gain);

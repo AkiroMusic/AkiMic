@@ -13,6 +13,7 @@ import os
 import ssl
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -42,7 +43,9 @@ def main():
     # settings-persistence assertions would silently test nothing
     with tempfile.TemporaryDirectory() as tmp:
         ctx = ServerContext(settings=Settings(base_dir=tmp), platform=get_platform(),
-                            port=port, lan_ip="127.0.0.1")
+                            port=port, lan_ip="127.0.0.1",
+                            pairing_secret="st-pairing-secret-test-0123456789abcdef",
+                            desktop_token="st-desktop-token-test-0123456789abcdef")
         start_server_thread(ctx)
         ok, msg = wait_server_ready(port, timeout=10)
         print(f"{'PASS' if ok else 'FAIL'}  /healthz probe  ({msg})")
@@ -96,11 +99,23 @@ def main():
             print(f"FAIL  lang parity: {e}")
             failures += 1
 
-        # settings POST round-trip, WITH on-disk persistence assertions
+        # settings POST round-trip, WITH on-disk persistence assertions.
+        # The desktop token header is required for full-access writes from
+        # loopback (same CSRF rule the WebView page obeys).
         try:
+            _, pair_body = fetch(base + "/api/pair_url")
+            pair = json.loads(pair_body)
+            token = pair.get("desktop_token", "")
+            ok = (len(token) >= 32 and pair.get("url", "").startswith("https://")
+                  and "?p=" in pair.get("url", ""))
+            print(f"{'PASS' if ok else 'FAIL'}  /api/pair_url (token+url shape)")
+            if not ok:
+                failures += 1
+
             req = urllib.request.Request(
                 base + "/api/settings",
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json",
+                         "X-AkiMic-Token": token},
                 data=json.dumps({"desktop_gain": 1.5}).encode(),
                 method="POST")
             with urllib.request.urlopen(req, context=CTX, timeout=10) as res:
@@ -118,9 +133,35 @@ def main():
             if not ok:
                 failures += 1
 
-            # out-of-range and non-object writes are rejected
-            ok = Settings(base_dir=tmp).update(["not", "a", "dict"]) in (True, False)
-            print("PASS  settings reject non-dict patch (no crash)")
+            # out-of-range value: rejected with 400, never clamped
+            req = urllib.request.Request(
+                base + "/api/settings",
+                headers={"Content-Type": "application/json",
+                         "X-AkiMic-Token": token},
+                data=json.dumps({"desktop_gain": 99}).encode(),
+                method="POST")
+            try:
+                urllib.request.urlopen(req, context=CTX, timeout=10)
+                print("FAIL  settings out-of-range rejected (got 200)")
+                failures += 1
+            except urllib.error.HTTPError as e:
+                ok = e.code == 400
+                print(f"{'PASS' if ok else 'FAIL'}  settings out-of-range rejected (400, got {e.code})")
+                if not ok:
+                    failures += 1
+
+            # missing token on a management endpoint → 403
+            req = urllib.request.Request(base + "/api/exit", data=b"{}", method="POST",
+                                         headers={"Content-Type": "application/json"})
+            try:
+                urllib.request.urlopen(req, context=CTX, timeout=10)
+                print("FAIL  /api/exit without token (got 200!)")
+                failures += 1
+            except urllib.error.HTTPError as e:
+                ok = e.code == 403
+                print(f"{'PASS' if ok else 'FAIL'}  /api/exit without token rejected (403, got {e.code})")
+                if not ok:
+                    failures += 1
         except Exception as e:
             print(f"FAIL  settings write: {e}")
             failures += 1

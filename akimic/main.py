@@ -56,19 +56,26 @@ def run() -> None:
 
     settings = Settings()
 
-    # TCP for the page, UDP for WebRTC ICE — without the UDP rule Windows
-    # pops a security alert on every phone connection and cancelling it
-    # kills the audio. Best effort; the packaged exe runs elevated.
-    fw_ok, fw_msg = net.ensure_firewall_rules()
-    if not fw_ok:
-        print(f"[{APP_NAME}] firewall rules skipped: {fw_msg}")
-
     lan_ip = net.get_lan_ip()
+    # pick the port BEFORE touching the firewall: if no port is free we bail
+    # out without ever creating rules
     try:
         port = net.find_free_port()
     except RuntimeError as e:
         _alert(APP_NAME, f"{APP_NAME} could not find a free port:\n{e}")
         return
+
+    # TCP for the page, UDP for WebRTC ICE — without the UDP rule Windows
+    # pops a security alert on every phone connection and cancelling it
+    # kills the audio. Best effort; the packaged exe runs elevated.
+    fw_ok, fw_msg, fw_added = net.ensure_firewall_rules()
+    if not fw_ok:
+        print(f"[{APP_NAME}] firewall rules skipped: {fw_msg}")
+
+    def _rollback_startup():
+        """Remove only the rules this boot created — never pre-existing ones."""
+        if fw_added:
+            net.remove_firewall_rules()
 
     # Persistent self-signed cert, trusted on this PC once (admin install).
     # Falls back to werkzeug's adhoc cert when generation fails.
@@ -91,15 +98,16 @@ def run() -> None:
         os.environ[key] = value
 
     pairing_secret = secrets.token_urlsafe(32)
+    desktop_token = secrets.token_urlsafe(32)
     ctx = ServerContext(settings=settings, platform=platform, port=port, lan_ip=lan_ip,
                         fw_ok=fw_ok, ssl_cert=ssl_cert, ssl_key=ssl_key,
-                        pairing_secret=pairing_secret)
+                        pairing_secret=pairing_secret, desktop_token=desktop_token)
     socketio = start_server_thread(ctx)
     # confirm OUR server (health endpoint) is actually listening — never a
     # blind sleep, and another HTTPS service on the port is detected
     ready, ready_msg = net.wait_server_ready(port, timeout=12)
     if not ready:
-        net.remove_firewall_rules()  # roll back this boot's rules
+        _rollback_startup()
         _alert(APP_NAME, f"{APP_NAME} server failed to start:\n{ready_msg}")
         return
 
@@ -131,7 +139,8 @@ def run() -> None:
 
     def _exit_app():
         tray.stop()
-        net.remove_firewall_rules()  # graceful exit leaves no inbound rules behind
+        if fw_added:
+            net.remove_firewall_rules()  # graceful exit leaves no inbound rules behind
         os._exit(0)
 
     tray = Tray(

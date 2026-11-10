@@ -113,6 +113,11 @@ class Settings:
         with self._lock:
             return dict(self._data)
 
+    def validate_key(self, key: str, value):
+        """Public wrapper so callers can pre-check a patch (server 400s when
+        every provided field is invalid)."""
+        return _validate(key, value)
+
     def update(self, patch) -> bool:
         """Validate + apply a patch; returns whether it persisted to disk."""
         if not isinstance(patch, dict):

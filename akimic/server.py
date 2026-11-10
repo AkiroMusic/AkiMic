@@ -31,7 +31,7 @@ from flask_socketio import SocketIO, emit
 
 from . import __version__
 from .driver.base import BasePlatform
-from .settings import Settings
+from .settings import DEFAULTS, Settings
 
 WEBUI_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webui")
 
@@ -44,7 +44,7 @@ class ServerContext:
 
     def __init__(self, settings: Settings, platform: BasePlatform, port: int, lan_ip: str,
                  fw_ok: bool = False, ssl_cert: str | None = None, ssl_key: str | None = None,
-                 pairing_secret: str = ""):
+                 pairing_secret: str = "", desktop_token: str = ""):
         self.settings = settings
         self.platform = platform
         self.port = port
@@ -52,7 +52,8 @@ class ServerContext:
         self.fw_ok = fw_ok
         self.ssl_cert = ssl_cert
         self.ssl_key = ssl_key
-        self.pairing_secret = pairing_secret
+        self.pairing_secret = pairing_secret   # mobile credential (QR ?p=)
+        self.desktop_token = desktop_token     # desktop credential (loopback API)
         self.on_lang_change = None   # callable(lang_code)
         self.on_mute_change = None   # callable(muted: bool) — phone source mute
 
@@ -68,19 +69,28 @@ def _json_object():
 
 
 def _origin_allowed(origin: str | None, ctx: ServerContext) -> bool:
-    """Browser cross-origin restriction only — NOT authentication (the
-    pairing token above is what actually gates roles)."""
+    """Exact match against the origins AkiMic itself serves (host AND port).
+    Comparing only the hostname would let any other localhost port claim to
+    be us. Scheme is matched but http/https both accepted for our own
+    address — production is https; the http variant exists for dev/testing.
+    Non-browser clients (no Origin) pass; Socket.IO roles are gated
+    separately by tokens."""
     if not origin:
         return True  # non-browser clients
-    host = urlsplit(origin).hostname
-    if not host:
-        return False
-    if host in ("localhost", "127.0.0.1") or host == ctx.lan_ip:
-        return True
     try:
-        return host.lower() == socket.gethostname().lower()
-    except OSError:
+        parts = urlsplit(origin)
+        if not parts.hostname:
+            return False
+        host = parts.hostname.lower()
+        port = parts.port  # malformed port raises → rejected below
+    except ValueError:
         return False
+    if port != ctx.port:
+        return False
+    if parts.scheme not in ("https", "http"):
+        return False
+    return host in ("localhost", "127.0.0.1", ctx.lan_ip,
+                    socket.gethostname().lower())
 
 
 def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
@@ -95,6 +105,16 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
     sid_role: dict[str, str] = {}
     desktop_sid: str | None = None
     active_offer_sid: str | None = None  # the mobile currently negotiating
+    state_lock = threading.Lock()  # threading mode: joins can race
+
+    def _mgmt_allowed() -> bool:
+        """Management POSTs: loopback AND our per-run CSRF token header.
+        Cross-origin pages can hit loopback URLs but cannot set custom
+        headers without a CORS preflight we never grant."""
+        if not _is_loopback():
+            return False
+        sent = request.headers.get("X-AkiMic-Token", "")
+        return bool(ctx.desktop_token) and secrets.compare_digest(sent, ctx.desktop_token)
 
     # ---- static pages ----------------------------------------------------
 
@@ -133,12 +153,16 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
 
     @app.route("/api/pair_url")
     def api_pair_url():
-        """QR target with the pairing secret — loopback only."""
+        """QR target (with the mobile pairing secret) and the desktop token.
+        Loopback only — the desktop page is the sole legitimate caller."""
         if not _is_loopback():
             return jsonify({"error": "local only"}), 403
-        return jsonify({
+        resp = jsonify({
             "url": f"https://{ctx.lan_ip}:{ctx.port}/?p={ctx.pairing_secret}",
+            "desktop_token": ctx.desktop_token,
         })
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
 
     @app.route("/healthz")
     def healthz():
@@ -165,21 +189,27 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
             if not _is_loopback():
                 # phones may only touch their own gain and the shared language
                 patch = {k: v for k, v in patch.items() if k in ("mobile_gain", "lang")}
-            persisted = ctx.settings.update(patch)
+            known = [k for k in patch if k in DEFAULTS]
+            valid = {k: v for k, v in patch.items()
+                     if ctx.settings.validate_key(k, v) is not None}
+            if known and not valid:
+                # every provided field was invalid — say so, don't fake success
+                return jsonify({"error": "all provided settings invalid"}), 400
+            persisted = ctx.settings.update(valid)
         data = ctx.settings.as_dict()
         data["persisted"] = bool(persisted) if request.method == "POST" else True
         return jsonify(data)
 
     @app.route("/api/driver/install", methods=["POST"])
     def api_driver_install():
-        if not _is_loopback():
+        if not _mgmt_allowed():
             return jsonify({"error": "local only"}), 403
         ok, msg = ctx.platform.install_driver()
         return jsonify({"success": ok, "msg": msg})
 
     @app.route("/api/driver/uninstall", methods=["POST"])
     def api_driver_uninstall():
-        if not _is_loopback():
+        if not _mgmt_allowed():
             return jsonify({"error": "local only"}), 403
         ok, msg = ctx.platform.uninstall_driver()
         if ok:
@@ -189,7 +219,7 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
 
     @app.route("/api/lang", methods=["POST"])
     def api_lang():
-        if not _is_loopback():
+        if not _mgmt_allowed():
             return jsonify({"error": "local only"}), 403
         data = _json_object()
         if data is None:
@@ -203,13 +233,13 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
     def api_mute():
         # desktop-page playback-mute sync; the tray follows the PHONE source
         # mute via the mute_state socket event instead
-        if not _is_loopback():
+        if not _mgmt_allowed():
             return jsonify({"error": "local only"}), 403
         return jsonify({"success": True})
 
     @app.route("/api/exit", methods=["POST"])
     def api_exit():
-        if not _is_loopback():
+        if not _mgmt_allowed():
             return jsonify({"error": "local only"}), 403
 
         def _quit():
@@ -231,14 +261,14 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
 
         role = data.get("role", "unknown")
         if role == "desktop":
-            # the desktop page only ever loads on this machine
-            if not _is_loopback():
-                emit("join_rejected", {"reason": "desktop_local_only"})
+            # loopback alone proves nothing (any local page is loopback) —
+            # require the per-run desktop token from /api/pair_url
+            token = data.get("token", "")
+            if (not _is_loopback() or not ctx.desktop_token
+                    or not isinstance(token, str)
+                    or not secrets.compare_digest(token, ctx.desktop_token)):
+                emit("join_rejected", {"reason": "desktop_auth_failed"})
                 return
-            if desktop_sid and desktop_sid != request.sid:
-                # single desktop slot: a newer page replaces a stale one
-                socketio.server.disconnect(desktop_sid, namespace="/")
-            desktop_sid = request.sid
         elif role == "mobile":
             token = data.get("token", "")
             # fail closed: an empty server-side secret must never open the door
@@ -246,22 +276,33 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
                     or not secrets.compare_digest(token, ctx.pairing_secret)):
                 emit("join_rejected", {"reason": "bad_token"})
                 return
-            others = sum(1 for sid, r in sid_role.items() if r == "mobile")
-            if others >= MAX_MOBILE_SENDERS:
-                emit("join_rejected", {"reason": "busy"})
-                return
         else:
             emit("join_rejected", {"reason": "unknown_role"})
             return
 
-        sid_role[request.sid] = role
-        socketio.server.enter_room(request.sid, role)
+        replace_sid = None
+        with state_lock:
+            if role == "desktop" and desktop_sid and desktop_sid != request.sid:
+                replace_sid = desktop_sid  # single desktop slot: replace stale page
+            elif role == "mobile":
+                others = sum(1 for sid, r in sid_role.items() if r == "mobile")
+                if others >= MAX_MOBILE_SENDERS:
+                    emit("join_rejected", {"reason": "busy"})
+                    return
+            sid_role[request.sid] = role
+            socketio.server.enter_room(request.sid, role)
+            if role == "desktop":
+                desktop_sid = request.sid
+            snapshot = {
+                "desktop_online": desktop_sid is not None,
+                "mobile_online": any(r == "mobile" for r in sid_role.values()),
+            }
+        # disconnect OUTSIDE the lock (its callback mutates the same state)
+        if replace_sid:
+            socketio.server.disconnect(replace_sid, namespace="/")
 
         # state snapshot so a freshly (re)opened page learns who is present…
-        emit("room_state", {
-            "desktop_online": desktop_sid is not None,
-            "mobile_online": any(r == "mobile" for r in sid_role.values()),
-        })
+        emit("room_state", snapshot)
         # …and notify the counterpart (covers "desktop first, phone second")
         counterpart = "desktop" if role == "mobile" else "mobile"
         socketio.emit("peer_joined", {"role": role}, to=counterpart)
@@ -269,11 +310,12 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
     @socketio.on("disconnect")
     def on_disconnect():
         nonlocal desktop_sid, active_offer_sid
-        role = sid_role.pop(request.sid, None)
-        if role == "desktop" and desktop_sid == request.sid:
-            desktop_sid = None
-        if request.sid == active_offer_sid:
-            active_offer_sid = None
+        with state_lock:
+            role = sid_role.pop(request.sid, None)
+            if role == "desktop" and desktop_sid == request.sid:
+                desktop_sid = None
+            if request.sid == active_offer_sid:
+                active_offer_sid = None
         if not role:
             return
         counterpart = "desktop" if role == "mobile" else "mobile"

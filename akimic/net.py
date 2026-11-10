@@ -151,16 +151,19 @@ def _rule_exists(name: str) -> bool:
     return code == 0 and name in out and "No rules match" not in out
 
 
-def ensure_firewall_rules() -> tuple[bool, str]:
+def ensure_firewall_rules() -> tuple[bool, str, bool]:
     """Allow phone→PC traffic: TCP 5000-5100 for the signaling server and
     UDP ephemeral ports for WebRTC ICE (WebView2 binds them when the phone
     connects — without this Windows pops the security alert on every
     connection, and cancelling it blocks the audio stream entirely).
     Both rules are scoped to the local subnet. Per-rule idempotent, so a
     partial previous run is completed rather than wiped and rebuilt.
+
+    Returns (ok, message, added_by_us) — added_by_us lets the caller roll
+    back only rules this boot created, never pre-existing same-name rules.
     """
     if sys.platform != "win32":
-        return True, "firewall management is Windows-only, skipped"
+        return True, "firewall management is Windows-only, skipped", False
 
     rules = (
         (FIREWALL_RULE_NAME, "TCP", f"{PORT_RANGE_START}-{PORT_RANGE_END}", "AkiMic LAN signaling"),
@@ -168,6 +171,7 @@ def ensure_firewall_rules() -> tuple[bool, str]:
     )
     ok = True
     parts = []
+    added = False
     for name, proto, port, desc in rules:
         if _rule_exists(name):
             parts.append(f"{proto}: present")
@@ -180,11 +184,12 @@ def ensure_firewall_rules() -> tuple[bool, str]:
             f"description={desc}",
         ])
         if code == 0:
+            added = True
             parts.append(f"{proto}: added")
         else:
             ok = False
             parts.append(f"{proto}: FAILED ({out.strip()[:80]})")
-    return ok, "; ".join(parts)
+    return ok, "; ".join(parts), added
 
 
 def remove_firewall_rules() -> tuple[bool, str]:

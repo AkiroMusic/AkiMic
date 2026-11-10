@@ -22,6 +22,10 @@ from .base import BasePlatform
 
 _SETUP_EXE = "VBCABLE_Setup_x64.exe"
 _UNINSTALLER_PATH = r"C:\Program Files\VB\CABLE\VBCABLE_Setup_x64.exe"
+# The VB-CABLE author's certificate CN (Vincent Burel / VB-Audio). Pinned by
+# name — thumbprints rotate on cert renewal; a mismatch here must stop the
+# elevated install.
+_EXPECTED_SIGNER_CN = "BUREL VINCENT"
 
 # Registry property keys of an audio endpoint's PropertyStore.
 _PKEY_FMT = "{a45c254e-df1c-4efd-8020-67d146a850e0}"
@@ -100,10 +104,20 @@ def _run_ps(code: str, timeout: int = 120) -> str | None:
 
 def _safe_extract(zf: zipfile.ZipFile, dest: str) -> None:
     """Extract entry by entry, refusing anything that escapes dest
-    (absolute paths, .. traversal) — no blind extractall() on a zip we
-    execute binaries from."""
+    (absolute paths, .. traversal) and capping the blast radius of a
+    swapped-in zip bomb. No blind extractall() on a zip we execute
+    binaries from."""
     dest_real = os.path.realpath(dest)
-    for info in zf.infolist():
+    total_size = 0
+    entries = zf.infolist()
+    if len(entries) > 200:
+        raise ValueError("zip has too many entries")
+    for info in entries:
+        if info.file_size > 64 * 1024 * 1024:
+            raise ValueError(f"zip entry too large: {info.filename!r}")
+        total_size += info.file_size
+        if total_size > 256 * 1024 * 1024:
+            raise ValueError("zip uncompressed total too large")
         name = info.filename
         parts = name.replace("\\", "/").split("/")
         if name.startswith(("/", "\\")) or ".." in parts or (len(parts) > 1 and parts[0].endswith(":")):
@@ -114,18 +128,33 @@ def _safe_extract(zf: zipfile.ZipFile, dest: str) -> None:
         zf.extract(info, dest)
 
 
-def _authenticode_status(path: str) -> str:
-    """Signature Status string ('Valid', 'NotSigned', 'HashMismatch', ...)."""
+def _authenticode_check(path: str) -> tuple[bool, str]:
+    """Fail-closed signature + publisher verification.
+
+    Returns (ok, message). Only a Valid signature by the expected VB-Audio
+    signer passes; NotSigned, NotTrusted, HashMismatch, UnknownError, empty
+    output and PowerShell failures all block the elevated install.
+    """
     try:
         proc = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
-             f"(Get-AuthenticodeSignature -LiteralPath '{path}').Status"],
+             f"$s = Get-AuthenticodeSignature -LiteralPath '{path}'; "
+             "Write-Output $s.Status; Write-Output $s.SignerCertificate.Subject"],
             capture_output=True, text=True, timeout=60,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
-        return proc.stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
-        return "UnknownError"
+        if proc.returncode != 0:
+            return False, f"signature check failed (powershell exit {proc.returncode})"
+        lines = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+        status = lines[0] if lines else ""
+        subject = lines[1] if len(lines) > 1 else ""
+        if status != "Valid":
+            return False, f"driver binary signature status: {status} — install aborted"
+        if _EXPECTED_SIGNER_CN.lower() not in subject.lower():
+            return False, f"driver binary signed by unexpected publisher: {subject[:80]}"
+        return True, f"signed by {subject[:60]}"
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"signature check failed: {e}"
 
 
 class WindowsPlatform(BasePlatform):
@@ -286,14 +315,11 @@ class WindowsPlatform(BasePlatform):
                 return False, "VBCABLE_Setup_x64.exe not found in package"
 
             # supply-chain check on the binary we are about to run elevated:
-            # a tampered (hash-mismatched) signature is a hard stop; an
-            # unsigned/unknown one only warns, since vendors vary
-            sig = _authenticode_status(setup)
-            note = ""
-            if sig == "HashMismatch":
-                return False, "driver binary signature check FAILED (HashMismatch) — install aborted"
-            if sig != "Valid":
-                note = f" (note: driver binary signature status: {sig})"
+            # fail-closed on anything but a Valid signature by VB-Audio
+            sig_ok, sig_msg = _authenticode_check(setup)
+            if not sig_ok:
+                return False, sig_msg
+            note = f" ({sig_msg})"
 
             if self.is_admin():
                 proc = subprocess.run(
