@@ -1,21 +1,26 @@
 """Flask + SocketIO server: static web UI, REST API and WebRTC signaling.
 
 Security model:
-- Management REST endpoints (driver install/uninstall, exit, lang, desktop
-  mute sync, full settings writes) are loopback-only — the phone may only
-  write its own gain and the shared language.
-- The desktop page always loads via 127.0.0.1, so its requests originate
-  from loopback and pass automatically.
-- Signaling: the desktop slot is single (a newer page replaces an older
-  one), only ONE mobile sender is accepted, and SDP/ICE is unicast between
-  the exact peer SIDs — never broadcast into shared rooms. Role checks are
-  enforced per event: only a joined mobile may send offers, only the
-  desktop may send answers.
+- Pairing: a per-run random secret is required for a client to join as
+  "mobile". The secret is handed to the phone inside the QR URL
+  (?p=...), so the QR itself is the credential; sockets without it are
+  rejected. The secret is never exposed on LAN-readable endpoints —
+  /api/pair_url (loopback-only) composes the QR URL for the desktop page.
+- Desktop role: joins are only accepted from loopback (the desktop page
+  always loads via 127.0.0.1, so local = trusted; LAN cannot claim it).
+- Management REST endpoints (driver install/uninstall, exit, lang, mute
+  sync, full settings writes) are loopback-only; phones may only write
+  their own gain and the shared language.
+- Signaling: single desktop slot (newer page replaces older), ONE mobile
+  sender, SDP/ICE unicast between exact peer SIDs with strict role and
+  payload (sdp type + length) validation. There is no inbound
+  toggle_mute — the tray emits it server-side only.
 
 The audio itself never passes through here; this is control-plane only.
 """
 
 import os
+import secrets
 import socket
 import threading
 import time
@@ -30,9 +35,7 @@ from .settings import Settings
 
 WEBUI_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webui")
 
-# One phone is the product: a second sender gets an explicit busy instead of
-# sharing the desktop with another stream (which would also crosstalk answers).
-MAX_MOBILE_SENDERS = 1
+MAX_MOBILE_SENDERS = 1  # a second phone gets an explicit busy
 _MAX_SDP_LEN = 65536
 
 
@@ -40,7 +43,8 @@ class ServerContext:
     """Shared state handed to routes and callbacks owned by main.py."""
 
     def __init__(self, settings: Settings, platform: BasePlatform, port: int, lan_ip: str,
-                 fw_ok: bool = False, ssl_cert: str | None = None, ssl_key: str | None = None):
+                 fw_ok: bool = False, ssl_cert: str | None = None, ssl_key: str | None = None,
+                 pairing_secret: str = ""):
         self.settings = settings
         self.platform = platform
         self.port = port
@@ -48,6 +52,7 @@ class ServerContext:
         self.fw_ok = fw_ok
         self.ssl_cert = ssl_cert
         self.ssl_key = ssl_key
+        self.pairing_secret = pairing_secret
         self.on_lang_change = None   # callable(lang_code)
         self.on_mute_change = None   # callable(muted: bool) — phone source mute
 
@@ -63,7 +68,8 @@ def _json_object():
 
 
 def _origin_allowed(origin: str | None, ctx: ServerContext) -> bool:
-    """Only pages served from this machine may open the signaling socket."""
+    """Browser cross-origin restriction only — NOT authentication (the
+    pairing token above is what actually gates roles)."""
     if not origin:
         return True  # non-browser clients
     host = urlsplit(origin).hostname
@@ -116,6 +122,7 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
 
     @app.route("/api/info")
     def api_info():
+        # deliberately WITHOUT the pairing secret (LAN-readable)
         return jsonify({
             "app": "AkiMic",
             "version": __version__,
@@ -123,6 +130,19 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
             "port": ctx.port,
             "url": f"https://{ctx.lan_ip}:{ctx.port}",
         })
+
+    @app.route("/api/pair_url")
+    def api_pair_url():
+        """QR target with the pairing secret — loopback only."""
+        if not _is_loopback():
+            return jsonify({"error": "local only"}), 403
+        return jsonify({
+            "url": f"https://{ctx.lan_ip}:{ctx.port}/?p={ctx.pairing_secret}",
+        })
+
+    @app.route("/healthz")
+    def healthz():
+        return jsonify({"app": "AkiMic", "version": __version__})
 
     @app.route("/api/platform")
     def api_platform():
@@ -145,8 +165,10 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
             if not _is_loopback():
                 # phones may only touch their own gain and the shared language
                 patch = {k: v for k, v in patch.items() if k in ("mobile_gain", "lang")}
-            ctx.settings.update(patch)
-        return jsonify(ctx.settings.as_dict())
+            persisted = ctx.settings.update(patch)
+        data = ctx.settings.as_dict()
+        data["persisted"] = bool(persisted) if request.method == "POST" else True
+        return jsonify(data)
 
     @app.route("/api/driver/install", methods=["POST"])
     def api_driver_install():
@@ -201,31 +223,48 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
     @socketio.on("join")
     def on_join(data):
         nonlocal desktop_sid, active_offer_sid
-        if not isinstance(data, dict) or request.sid in sid_role:
-            return  # malformed or already joined (no role switching)
-        role = data.get("role", "unknown")
-        if role not in ("mobile", "desktop"):
+        if not isinstance(data, dict):
+            emit("join_rejected", {"reason": "malformed"})
             return
+        if request.sid in sid_role:
+            return  # already joined (no role switching)
 
+        role = data.get("role", "unknown")
         if role == "desktop":
+            # the desktop page only ever loads on this machine
+            if not _is_loopback():
+                emit("join_rejected", {"reason": "desktop_local_only"})
+                return
             if desktop_sid and desktop_sid != request.sid:
                 # single desktop slot: a newer page replaces a stale one
                 socketio.server.disconnect(desktop_sid, namespace="/")
             desktop_sid = request.sid
-        else:
+        elif role == "mobile":
+            token = data.get("token", "")
+            # fail closed: an empty server-side secret must never open the door
+            if (not ctx.pairing_secret or not isinstance(token, str)
+                    or not secrets.compare_digest(token, ctx.pairing_secret)):
+                emit("join_rejected", {"reason": "bad_token"})
+                return
             others = sum(1 for sid, r in sid_role.items() if r == "mobile")
             if others >= MAX_MOBILE_SENDERS:
                 emit("join_rejected", {"reason": "busy"})
                 return
+        else:
+            emit("join_rejected", {"reason": "unknown_role"})
+            return
 
         sid_role[request.sid] = role
         socketio.server.enter_room(request.sid, role)
 
-        # state snapshot so a freshly (re)opened page learns who is present
+        # state snapshot so a freshly (re)opened page learns who is present…
         emit("room_state", {
             "desktop_online": desktop_sid is not None,
             "mobile_online": any(r == "mobile" for r in sid_role.values()),
         })
+        # …and notify the counterpart (covers "desktop first, phone second")
+        counterpart = "desktop" if role == "mobile" else "mobile"
+        socketio.emit("peer_joined", {"role": role}, to=counterpart)
 
     @socketio.on("disconnect")
     def on_disconnect():
@@ -240,8 +279,9 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
         counterpart = "desktop" if role == "mobile" else "mobile"
         socketio.emit("peer_left", {"role": role}, to=counterpart)
 
-    def _valid_sdp(data) -> bool:
+    def _valid_sdp(data, expected_type: str) -> bool:
         return (isinstance(data, dict)
+                and data.get("type") == expected_type
                 and isinstance(data.get("sdp"), str)
                 and 0 < len(data["sdp"]) <= _MAX_SDP_LEN)
 
@@ -253,7 +293,7 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
     @socketio.on("offer")
     def on_offer(data):
         nonlocal active_offer_sid
-        if sid_role.get(request.sid) != "mobile" or not _valid_sdp(data):
+        if sid_role.get(request.sid) != "mobile" or not _valid_sdp(data, "offer"):
             return
         active_offer_sid = request.sid
         if desktop_sid:
@@ -261,7 +301,7 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
 
     @socketio.on("answer")
     def on_answer(data):
-        if sid_role.get(request.sid) != "desktop" or not _valid_sdp(data):
+        if sid_role.get(request.sid) != "desktop" or not _valid_sdp(data, "answer"):
             return
         if active_offer_sid:
             emit("answer", data, to=active_offer_sid)
@@ -286,10 +326,8 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
         if ctx.on_mute_change:
             ctx.on_mute_change(bool(data.get("muted", False)))
 
-    @socketio.on("toggle_mute")
-    def on_toggle_mute():
-        # tray → phone (the tray button toggles the phone source)
-        socketio.emit("toggle_mute", to="mobile")
+    # NOTE: no inbound toggle_mute — the tray emits it server-side only, so
+    # LAN clients cannot flip the phone's mute.
 
     return app, socketio
 

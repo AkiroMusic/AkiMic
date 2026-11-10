@@ -48,6 +48,8 @@
   "m_connected": "已连接",
   "m_disconnected": "已断开",
   "m_tap_start": "点按开始",
+  "m_starting": "启动中…",
+  "m_busy": "主机正被另一台手机使用",
   "m_active": "开麦中",
   "m_muted": "已静音",
   "m_hint": "说话时请保持本页面打开",

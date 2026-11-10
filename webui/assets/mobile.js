@@ -10,10 +10,15 @@ const S = {
   analyser: null, vuBuf: null, dest: null,
   rafId: 0, statsTimer: 0, retryTimer: 0, lastAttempt: 0, rttEma: null,
   pendingIce: [],
-  mode: 'idle',            // idle | live | muted
+  mode: 'idle',            // idle | starting | live | muted
   pcState: 'new',
+  joined: false,           // false | true | 'rejected' — accepted as mobile?
+  desktopOnline: false,
   wakeLock: null,
 };
+
+// per-run pairing secret handed over in the QR URL (?p=...)
+const PAIRING_TOKEN = new URLSearchParams(location.search).get('p') || '';
 
 const rtcConfig = { iceServers: [] };
 
@@ -70,6 +75,11 @@ function updateUI() {
     icon.innerHTML = MIC_ON;
     label.textContent = t('m_tap_start');
     $('mic-state').textContent = t('m_hint');
+  } else if (S.mode === 'starting') {
+    btn.className = 'mic-btn';
+    icon.innerHTML = MIC_ON;
+    label.textContent = t('m_starting');
+    $('mic-state').textContent = t('m_wait_conn');
   } else if (S.mode === 'muted') {
     btn.className = 'mic-btn muted';
     icon.innerHTML = MIC_OFF;
@@ -83,10 +93,19 @@ function updateUI() {
       ? t('m_keep_screen') : t('m_reconnecting');
   }
 
+  // "host online" means the desktop peer is present, not just our socket
   const dot = $('host-dot');
-  const connected = S.socket && S.socket.connected;
-  dot.className = `dot ${connected ? 'ok' : 'bad'}`;
-  $('host-text').textContent = connected ? t('m_connected') : t('m_disconnected');
+  const text = $('host-text');
+  if (S.joined === 'rejected') {
+    dot.className = 'dot bad';
+    text.textContent = t('m_busy');
+  } else if (S.desktopOnline) {
+    dot.className = 'dot ok';
+    text.textContent = t('m_connected');
+  } else {
+    dot.className = S.socket && S.socket.connected ? 'dot wait' : 'dot bad';
+    text.textContent = t('m_wait_conn');
+  }
 
   const sub = $('link-sub');
   if (S.mode === 'idle') sub.textContent = '';
@@ -211,38 +230,50 @@ function startStatsLoop() {
 /* ---------- mic control ---------- */
 
 async function startMic() {
+  if (S.mode !== 'idle') return;  // starting guard: no concurrent captures
+  S.mode = 'starting';
+  updateUI();
+
+  let stream = null;
+  let ctx = null;
   try {
-    S.stream = await navigator.mediaDevices.getUserMedia({
+    stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
     });
+
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const source = ctx.createMediaStreamSource(stream);
+    const gain = ctx.createGain();
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    const dest = ctx.createMediaStreamDestination();
+
+    // 0 must stay 0 (a saved gain of zero is valid) — no falsy-coalescing here
+    const saved = parseFloat($('gain-slider').value);
+    gain.gain.value = Number.isFinite(saved) ? saved : 1;
+
+    source.connect(gain);
+    gain.connect(analyser);
+    gain.connect(dest);
+
+    S.stream = stream; S.audioCtx = ctx; S.source = source; S.gainNode = gain;
+    S.analyser = analyser; S.vuBuf = new Uint8Array(analyser.fftSize); S.dest = dest;
+
+    S.mode = 'live';
+    updateUI();
+    vuLoop();
+    acquireWakeLock();
+    startStreaming().catch(() => scheduleRestart());
   } catch (e) {
+    // any failure: release what we grabbed, back to a clean idle
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    if (ctx) { try { ctx.close(); } catch (e2) {} }
+    S.stream = null; S.audioCtx = null; S.gainNode = null;
+    S.analyser = null; S.dest = null;
     $('modal-denied').hidden = false;
-    return;
+    S.mode = 'idle';
+    updateUI();
   }
-
-  const ctx = new (window.AudioContext || window.webkitAudioContext)();
-  const source = ctx.createMediaStreamSource(S.stream);
-  const gain = ctx.createGain();
-  const analyser = ctx.createAnalyser();
-  analyser.fftSize = 512;
-  const dest = ctx.createMediaStreamDestination();
-
-  // 0 must stay 0 (a saved gain of zero is valid) — no falsy-coalescing here
-  const saved = parseFloat($('gain-slider').value);
-  gain.gain.value = Number.isFinite(saved) ? saved : 1;
-
-  source.connect(gain);
-  gain.connect(analyser);
-  gain.connect(dest);
-
-  S.audioCtx = ctx; S.source = source; S.gainNode = gain;
-  S.analyser = analyser; S.vuBuf = new Uint8Array(analyser.fftSize); S.dest = dest;
-
-  S.mode = 'live';
-  updateUI();
-  vuLoop();
-  acquireWakeLock();
-  startStreaming().catch(() => scheduleRestart());
 }
 
 function reportMuteState() {
@@ -252,6 +283,12 @@ function reportMuteState() {
 }
 
 function toggleMic() {
+  if (S.joined !== true) {
+    // rejected (busy/bad pairing) or the desktop has not joined yet
+    $('mic-state').textContent = S.joined === 'rejected' ? t('m_busy') : t('m_wait_conn');
+    return;
+  }
+  if (S.mode === 'starting') return;
   if (S.mode === 'idle') {
     startMic();
   } else if (S.mode === 'live') {
@@ -278,12 +315,32 @@ function connectSocket() {
   S.socket = socket;
 
   socket.on('connect', () => {
-    socket.emit('join', { role: 'mobile' });
+    socket.emit('join', { role: 'mobile', token: PAIRING_TOKEN });
     updateUI();
     reportMuteState();
     if (S.mode !== 'idle' && S.pcState !== 'connected') {
       startStreaming().catch(() => scheduleRestart());
     }
+  });
+
+  socket.on('room_state', (data) => {
+    // received only after a successful join
+    S.joined = true;
+    S.desktopOnline = !!(data && data.desktop_online);
+    updateUI();
+  });
+
+  socket.on('join_rejected', (data) => {
+    S.joined = 'rejected';
+    updateUI();
+  });
+
+  socket.on('peer_joined', (d) => {
+    if (d.role === 'desktop') { S.desktopOnline = true; updateUI(); }
+  });
+
+  socket.on('peer_left', (d) => {
+    if (d.role === 'desktop') { S.desktopOnline = false; updateUI(); }
   });
 
   socket.on('disconnect', () => { updateUI(); });

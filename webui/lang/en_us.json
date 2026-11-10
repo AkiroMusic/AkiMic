@@ -48,6 +48,8 @@
   "m_connected": "Connected",
   "m_disconnected": "Disconnected",
   "m_tap_start": "Tap to start",
+  "m_starting": "Starting…",
+  "m_busy": "Host is in use by another phone",
   "m_active": "LIVE",
   "m_muted": "MUTED",
   "m_hint": "Keep this page open while talking",

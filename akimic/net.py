@@ -56,8 +56,14 @@ def get_lan_ip() -> str:
     return "127.0.0.1"
 
 
-def wait_server_ready(port: int, timeout: float = 10.0) -> tuple[bool, str]:
-    """Poll until the HTTPS signaling server answers on loopback."""
+def wait_server_ready(port: int, timeout: float = 12.0) -> tuple[bool, str]:
+    """Poll until OUR signaling server answers /healthz on loopback.
+
+    A plain TLS handshake is not enough — another HTTPS service could own
+    the port — so the probe issues a real GET and verifies the response
+    identifies AkiMic. Per-attempt failures (server still starting) are
+    retried until the deadline.
+    """
     deadline = time.time() + timeout
     verify_off = ssl.create_default_context()
     verify_off.check_hostname = False
@@ -65,13 +71,22 @@ def wait_server_ready(port: int, timeout: float = 10.0) -> tuple[bool, str]:
     while time.time() < deadline:
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=1.5) as raw:
-                try:
-                    with verify_off.wrap_socket(raw):
+                with verify_off.wrap_socket(raw) as ts:
+                    ts.settimeout(2)
+                    ts.sendall(b"GET /healthz HTTP/1.1\r\n"
+                               b"Host: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                    data = b""
+                    while len(data) < 8192:
+                        chunk = ts.recv(1024)
+                        if not chunk:
+                            break
+                        data += chunk
+                    if b'"app": "AkiMic"' in data or b'"app":"AkiMic"' in data:
                         return True, "ready"
-                except (ssl.SSLError, OSError):
-                    return False, "port is open but TLS handshake failed (port taken by another service?)"
-        except OSError:
-            time.sleep(0.3)
+                    return False, "port is open but it is not AkiMic (another service?)"
+        except (ssl.SSLError, OSError):
+            pass
+        time.sleep(0.3)
     return False, f"server did not become ready within {timeout:.0f}s"
 
 
@@ -83,7 +98,7 @@ def find_free_port(start: int = PORT_RANGE_START, end: int = PORT_RANGE_END) -> 
                 return port
             except OSError:
                 continue
-    return start
+    raise RuntimeError(f"no free port in range {start}-{end}")
 
 
 def acquire_single_instance_lock() -> bool:

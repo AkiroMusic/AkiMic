@@ -10,7 +10,7 @@ const S = {
   audioCtx: null, gainNode: null, analyser: null, vuBuf: null, pumpEl: null,
   rafId: 0, statsTimer: 0, statsLevel: 0,
   rttEma: null, lossEma: null, lastLost: null, lastRecv: null,
-  streamId: null, pendingIce: [],
+  streamId: null, pendingIce: [], pairUrl: '',
   muted: false, playing: false, phoneHere: false,
   devices: [], selectedDevice: 'default', micLabel: '',
 };
@@ -199,8 +199,13 @@ async function loadDevices() {
     try {
       probe = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (e) {
-      await new Promise((r) => setTimeout(r, 800));
-      probe = await navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => null);
+      if (e && e.name === 'NotAllowedError') {
+        probe = null;  // denied: labels stay generic, never auto-retry
+      } else {
+        // transient (device busy etc.): a single retry after a pause
+        await new Promise((r) => setTimeout(r, 800));
+        probe = await navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => null);
+      }
     }
     if (probe) probe.getTracks().forEach((tr) => tr.stop());
 
@@ -449,12 +454,30 @@ function connectSocket() {
   });
 
   socket.on('room_state', (data) => {
-    // snapshot for a freshly opened page: the phone may already be waiting
-    if (!data || !data.mobile_online || S.phoneHere) return;
-    S.phoneHere = true;
-    setPhonePill('good');
-    $('phone-pill-text').textContent = t('d_status_connected');
-    showWaitPanel(false);
+    // authoritative snapshot: true connects, false resets stale state
+    // (e.g. after our own socket reconnects while the phone is gone)
+    if (!data) return;
+    if (data.mobile_online && !S.phoneHere) {
+      S.phoneHere = true;
+      setPhonePill('good');
+      $('phone-pill-text').textContent = t('d_status_connected');
+      showWaitPanel(false);
+    } else if (!data.mobile_online && S.phoneHere) {
+      S.phoneHere = false;
+      setPhonePill('bad');
+      $('phone-pill-text').textContent = t('d_status_reconnect');
+      showWaitPanel(true);
+      fullTeardown();
+    }
+  });
+
+  socket.on('disconnect', () => {
+    // signaling lost: nothing about the phone state can be trusted anymore
+    if (S.phoneHere) fullTeardown();
+    S.phoneHere = false;
+    setPhonePill('bad');
+    $('phone-pill-text').textContent = t('d_status_reconnect');
+    showWaitPanel(true);
   });
 }
 
@@ -527,7 +550,11 @@ async function init() {
 
   $('brand-ver').textContent = S.info.version || '';
   $('about-ver').textContent = S.info.version || '';
-  $('url-text').textContent = S.info.url || '';
+
+  // the QR carries the per-run pairing secret — composed on loopback only
+  const pair = await api('/api/pair_url');
+  S.pairUrl = (pair && pair.url) || S.info.url || '';
+  $('url-text').textContent = S.pairUrl;
 
   applyTheme(S.settings.theme || 'dark');
 
@@ -537,9 +564,9 @@ async function init() {
   await loadLang(lang);
 
   // QR (dark modules on white box, fixed for scanning contrast)
-  if (S.info.url) {
+  if (S.pairUrl) {
     new QRCode($('qrcode'), {
-      text: S.info.url, width: 150, height: 150,
+      text: S.pairUrl, width: 150, height: 150,
       colorDark: '#0C1220', colorLight: '#ffffff', correctLevel: QRCode.CorrectLevel.H,
     });
   }
@@ -569,7 +596,7 @@ async function init() {
   updateMicUI();
 
   /* ---- event wiring ---- */
-  $('btn-copy-url').addEventListener('click', () => copyText(S.info.url || ''));
+  $('btn-copy-url').addEventListener('click', () => copyText(S.pairUrl || S.info.url || ''));
   $('device-chip').addEventListener('click', () =>
       copyText((S.platform && S.platform.driver_display_name) || 'CABLE Output'));
   $('mic-btn').addEventListener('click', toggleMute);

@@ -9,8 +9,8 @@
 
 **AkiMic** turns your phone into a wireless microphone for your Windows PC. Audio streams over LAN WebRTC straight into a virtual audio device — one click to set up, nothing to install on the phone: scan a QR code, tap once, talk.
 
-> **v1.0.0 — One-click flow**
-> Launch and everything is automatic: virtual driver check, firewall rules (no security popups), trusted local certificate, QR pairing and device matching. Auto-reconnect survives lock screens and Wi-Fi hiccups.
+> **v1.0.1 — Security & reliability hardening**
+> Authenticated pairing (the QR carries a per-run secret), loopback-only management APIs, fixed the audio lifecycle bug behind "connected but silent", ICE queueing on both ends, firewall rules cleaned up on exit.
 
 ## Download
 
@@ -45,7 +45,7 @@ Apps (Discord / games) pick "CABLE Output" as microphone ◀──────�
 ```
 
 - Python only handles signaling (Socket.IO), the bundled UI, driver management and the window shell — **audio never passes through Python**, which keeps latency at LAN-WebRTC level.
-- HTTPS uses a throwaway self-signed certificate (browsers require secure context for microphone access). Accept the warning on the phone once.
+- HTTPS uses a persistent self-signed certificate for the LAN (browsers require a secure context for microphone access). Accept the warning on the phone once; on the PC the certificate is trusted via the Windows Root store.
 
 ## Requirements
 
@@ -107,8 +107,8 @@ GPL-3.0 (see `LICENSE`). Inspired by ZeroMic by Hypixice Studio; VB-CABLE is a s
 
 **AkiMic** 把手机变成 Windows 电脑的无线麦克风：音频经局域网 WebRTC 直连进虚拟声卡——一键配置，手机无需安装任何 App：扫码、点一下、开说。
 
-> **v1.0.0 —— 一键流程**
-> 启动后全自动：虚拟驱动检测、防火墙放行（不弹安全警报）、本机受信任证书、扫码配对与设备匹配。自动重连可穿越锁屏与 Wi-Fi 抖动。
+> **v1.0.1 —— 安全与可靠性加固**
+> 扫码配对带一次性配对密钥、管理接口仅限本机、修复"已连接但无音频"的生命周期缺陷、两端 ICE 排队、退出时清理防火墙规则。
 
 ## 下载
 
@@ -143,7 +143,7 @@ AkiMic 参考开源项目 [ZeroMic](https://github.com/hypixice/ZeroMic)（GPL-3
 ```
 
 - Python 只负责信令（Socket.IO）、内置网页、驱动管理与窗口壳，**音频数据完全不经过 Python**，延迟就是局域网 WebRTC 的延迟。
-- HTTPS 使用临时自签名证书（浏览器要求安全上下文才给麦克风权限），手机上首次需手动信任一次。
+- HTTPS 使用持久的局域网自签名证书（浏览器要求安全上下文才给麦克风权限）。手机首次需手动信任一次；电脑端证书已通过系统根存储信任。
 
 ## 环境要求
 

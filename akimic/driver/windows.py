@@ -98,6 +98,36 @@ def _run_ps(code: str, timeout: int = 120) -> str | None:
         return None
 
 
+def _safe_extract(zf: zipfile.ZipFile, dest: str) -> None:
+    """Extract entry by entry, refusing anything that escapes dest
+    (absolute paths, .. traversal) — no blind extractall() on a zip we
+    execute binaries from."""
+    dest_real = os.path.realpath(dest)
+    for info in zf.infolist():
+        name = info.filename
+        parts = name.replace("\\", "/").split("/")
+        if name.startswith(("/", "\\")) or ".." in parts or (len(parts) > 1 and parts[0].endswith(":")):
+            raise ValueError(f"unsafe zip entry: {name!r}")
+        target = os.path.realpath(os.path.join(dest, name))
+        if target != dest_real and not target.startswith(dest_real + os.sep):
+            raise ValueError(f"unsafe zip entry: {name!r}")
+        zf.extract(info, dest)
+
+
+def _authenticode_status(path: str) -> str:
+    """Signature Status string ('Valid', 'NotSigned', 'HashMismatch', ...)."""
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-AuthenticodeSignature -LiteralPath '{path}').Status"],
+            capture_output=True, text=True, timeout=60,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        return proc.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return "UnknownError"
+
+
 class WindowsPlatform(BasePlatform):
     @property
     def use_system_browser(self) -> bool:
@@ -250,10 +280,20 @@ class WindowsPlatform(BasePlatform):
         temp_dir = tempfile.mkdtemp(prefix="akimic_")
         try:
             with zipfile.ZipFile(zip_path, "r") as zf:
-                zf.extractall(temp_dir)
+                _safe_extract(zf, temp_dir)
             setup = os.path.join(temp_dir, _SETUP_EXE)
             if not os.path.exists(setup):
                 return False, "VBCABLE_Setup_x64.exe not found in package"
+
+            # supply-chain check on the binary we are about to run elevated:
+            # a tampered (hash-mismatched) signature is a hard stop; an
+            # unsigned/unknown one only warns, since vendors vary
+            sig = _authenticode_status(setup)
+            note = ""
+            if sig == "HashMismatch":
+                return False, "driver binary signature check FAILED (HashMismatch) — install aborted"
+            if sig != "Valid":
+                note = f" (note: driver binary signature status: {sig})"
 
             if self.is_admin():
                 proc = subprocess.run(
@@ -278,7 +318,7 @@ class WindowsPlatform(BasePlatform):
 
             if not self._wait_for_device():
                 return False, "installer finished but the device did not appear (try again or reboot)"
-            return True, "installed"
+            return True, "installed" + note
         except Exception as e:
             return False, f"install error: {e}"
         finally:
