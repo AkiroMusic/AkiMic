@@ -9,6 +9,7 @@ because the VB-CABLE installer likes to promote itself to default speaker.
 """
 
 import ctypes
+import json
 import os
 import shutil
 import subprocess
@@ -143,20 +144,26 @@ def _authenticode_check(path: str) -> tuple[bool, str]:
         proc = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
              "$s = Get-AuthenticodeSignature -LiteralPath $env:AKIMIC_SIGN_PATH; "
-             "if ($null -eq $s) { Write-Output 'LoadError'; Write-Output '' } "
+             "if ($null -eq $s) { "
+             "Write-Output '{\"status\":null,\"cn\":null}' } "
              "else { "
-             "Write-Output $s.Status; "
-             "Write-Output $s.SignerCertificate.GetNameInfo("
-             "[System.Security.Cryptography.X509Certificates.X500NameFormat]::SimpleName, $false) }"],
+             "$cn = $null; "
+             "if ($null -ne $s.SignerCertificate) { "
+             "$cn = $s.SignerCertificate.GetNameInfo("
+             "[System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) }; "
+             "@{ status = [string]$s.Status; cn = $cn } | ConvertTo-Json -Compress }"],
             capture_output=True, text=True, timeout=60,
             creationflags=subprocess.CREATE_NO_WINDOW,
             env=env,
         )
         if proc.returncode != 0:
             return False, f"signature check failed (powershell exit {proc.returncode})"
-        lines = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
-        status = lines[0] if lines else "UnknownError"
-        cn = lines[1] if len(lines) > 1 else ""
+        try:
+            payload = json.loads(proc.stdout.strip() or "{}")
+            status = payload.get("status")
+            cn = payload.get("cn") or ""
+        except (json.JSONDecodeError, AttributeError):
+            return False, "signature check output unparseable — install aborted"
         if status != "Valid":
             return False, f"driver binary signature status: {status} — install aborted"
         if cn.lower() != _EXPECTED_SIGNER_CN.lower():
@@ -338,13 +345,16 @@ class WindowsPlatform(BasePlatform):
                 ok = proc.returncode == 0
             else:
                 # Elevate through PowerShell; the packaged exe has uac-admin,
-                # this branch only covers bare dev runs.
+                # this branch only covers bare dev runs. The path travels via
+                # an env var — never interpolated into the command text.
                 proc = subprocess.run(
                     ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command",
-                     f'$p = Start-Process -FilePath "{setup}" -ArgumentList "-i -h" '
-                     f"-Verb RunAs -Wait -WindowStyle Hidden -PassThru; exit $p.ExitCode"],
+                     '$p = Start-Process -FilePath $env:AKIMIC_INSTALLER_PATH '
+                     '-ArgumentList "-i -h" -Verb RunAs -Wait -WindowStyle Hidden '
+                     "-PassThru; exit $p.ExitCode"],
                     capture_output=True, timeout=300,
                     creationflags=subprocess.CREATE_NO_WINDOW,
+                    env={**os.environ, "AKIMIC_INSTALLER_PATH": setup},
                 )
                 ok = proc.returncode in (0, 1)
 

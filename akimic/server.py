@@ -288,24 +288,34 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
             emit("join_rejected", {"reason": "unknown_role"})
             return
 
+        # all state judgment and mutation under the lock (a SID can race
+        # itself with concurrent joins); every emit / disconnect outside it
+        duplicate = False
+        busy = False
         replace_sid = None
+        snapshot = None
         with state_lock:
-            if role == "desktop" and desktop_sid and desktop_sid != request.sid:
+            if request.sid in sid_role:
+                duplicate = True  # re-check under the lock: no role switching
+            elif role == "desktop" and desktop_sid and desktop_sid != request.sid:
                 replace_sid = desktop_sid  # single desktop slot: replace stale page
             elif role == "mobile":
                 others = sum(1 for sid, r in sid_role.items() if r == "mobile")
-                if others >= MAX_MOBILE_SENDERS:
-                    emit("join_rejected", {"reason": "busy"})
-                    return
-            sid_role[request.sid] = role
-            socketio.server.enter_room(request.sid, role)
-            if role == "desktop":
-                desktop_sid = request.sid
-            snapshot = {
-                "desktop_online": desktop_sid is not None,
-                "mobile_online": any(r == "mobile" for r in sid_role.values()),
-            }
-        # disconnect OUTSIDE the lock (its callback mutates the same state)
+                busy = others >= MAX_MOBILE_SENDERS
+            if not duplicate and not busy:
+                sid_role[request.sid] = role
+                socketio.server.enter_room(request.sid, role)
+                if role == "desktop":
+                    desktop_sid = request.sid
+                snapshot = {
+                    "desktop_online": desktop_sid is not None,
+                    "mobile_online": any(r == "mobile" for r in sid_role.values()),
+                }
+        if duplicate:
+            return
+        if busy:
+            emit("join_rejected", {"reason": "busy"})
+            return
         if replace_sid:
             socketio.server.disconnect(replace_sid, namespace="/")
 
@@ -382,10 +392,15 @@ def create_server(ctx: ServerContext) -> tuple[Flask, SocketIO]:
     @socketio.on("mute_state")
     def on_mute_state(data):
         # phone source mute → tray label
-        if sid_role.get(request.sid) != "mobile" or not isinstance(data, dict):
+        with state_lock:
+            role = sid_role.get(request.sid)
+        if role != "mobile" or not isinstance(data, dict):
+            return
+        muted = data.get("muted")
+        if type(muted) is not bool:  # strict: missing field and non-bools are dropped
             return
         if ctx.on_mute_change:
-            ctx.on_mute_change(bool(data.get("muted", False)))
+            ctx.on_mute_change(muted)
 
     # NOTE: no inbound toggle_mute — the tray emits it server-side only, so
     # LAN clients cannot flip the phone's mute.

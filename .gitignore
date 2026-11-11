@@ -13,3 +13,6 @@ settings.json
 
 # Reference project (kept read-only, never tracked)
 REF-ZeroMic-main/
+
+# Local security-scanner cache (Mimosa hook)
+.mimosa/

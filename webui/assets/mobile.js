@@ -155,23 +155,42 @@ function vuLoop() {
 /* ---------- WebRTC ---------- */
 
 function closePc() {
+  clearTimeout(S.retryTimer); S.retryTimer = 0;
   if (S.pc) { try { S.pc.close(); } catch (e) {} S.pc = null; }
   clearInterval(S.statsTimer); S.statsTimer = 0;
   S.rttEma = null;
   S.pendingIce = [];
 }
 
+function armRetry(ms) {
+  // single retry choke point: clears any pending timer first, so stale
+  // retries can never stack up behind an event that already recovered
+  clearTimeout(S.retryTimer);
+  S.retryTimer = setTimeout(retryTick, ms);
+}
+
+function retryTick() {
+  S.retryTimer = 0;
+  // re-validate every precondition: a healthy connection is never torn
+  // down from here — recovery while offline is event-driven (room_state /
+  // peer_joined re-invoke startStreaming), so a missed retry is harmless
+  if (S.mode === 'idle' || S.joined !== true || !S.desktopOnline) return;
+  if (!S.stream || !S.dest || !S.socket || !S.socket.connected) return;
+  if (S.pcState === 'connected') return;
+  startStreaming().catch(() => armRetry(2100));
+}
+
 async function startStreaming() {
   // single precondition gate: every entry point (button, reconnect,
-  // room_state, visibilitychange) funnels through here
-  if (S.joined !== true || !S.desktopOnline) {
-    S.retryTimer = setTimeout(startStreaming, 2100);
-    return;
-  }
+  // room_state, visibilitychange) funnels through here. Gate failures
+  // must NOT self-reschedule — room_state / peer_joined / reconnect
+  // handlers already re-invoke us, and self-rescheduling leaks stale
+  // timers that would tear down a healthy PC after recovery.
+  if (S.joined !== true || !S.desktopOnline) return;
   if (!S.stream || !S.dest || !S.socket || !S.socket.connected) return;
   const now = Date.now();
   if (now - S.lastAttempt < 2000) {
-    S.retryTimer = setTimeout(startStreaming, 2100);
+    armRetry(2100);  // coalesce duplicate triggers into one guarded retry
     return;
   }
   S.lastAttempt = now;
@@ -187,6 +206,7 @@ async function startStreaming() {
     S.pcState = pc.connectionState;
     updateUI();
     if (pc.connectionState === 'connected') {
+      clearTimeout(S.retryTimer); S.retryTimer = 0;
       startStatsLoop();
     } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
       if (S.mode !== 'idle') scheduleRestart();
@@ -202,13 +222,7 @@ async function startStreaming() {
 }
 
 function scheduleRestart() {
-  clearTimeout(S.retryTimer);
-  S.retryTimer = setTimeout(() => {
-    if (S.mode !== 'idle' && S.socket && S.socket.connected
-        && S.pcState !== 'connected') {
-      startStreaming().catch(() => scheduleRestart());
-    }
-  }, 2000);
+  armRetry(2000);
 }
 
 function startStatsLoop() {
@@ -365,7 +379,11 @@ function connectSocket() {
   });
 
   socket.on('peer_left', (d) => {
-    if (d.role === 'desktop') { S.desktopOnline = false; updateUI(); }
+    if (d.role === 'desktop') {
+      S.desktopOnline = false;
+      clearTimeout(S.retryTimer); S.retryTimer = 0;
+      updateUI();
+    }
   });
 
   socket.on('disconnect', () => {
@@ -373,6 +391,7 @@ function connectSocket() {
     // a fresh room_state after reconnect restores them
     S.joined = false;
     S.desktopOnline = false;
+    clearTimeout(S.retryTimer); S.retryTimer = 0;
     updateUI();
   });
 

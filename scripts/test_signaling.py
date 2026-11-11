@@ -137,6 +137,16 @@ check("mobile mute_state reaches callback (False)", mute_calls == [True, False])
 d1.emit("mute_state", {"muted": True})
 check("desktop cannot trigger mute callback", mute_calls == [True, False])
 
+# strict payload validation: only JSON booleans may change tray mute
+for bad in ("false", 1, 0, None, [], {}, [True]):
+    mobile.emit("mute_state", {"muted": bad})
+check("mute_state non-bool payloads dropped (string/num/null/array)",
+      mute_calls == [True, False])
+mobile.emit("mute_state", {})
+check("mute_state missing field dropped", mute_calls == [True, False])
+mobile.emit("mute_state", {"muted": True})
+check("mute_state valid bool still passes", mute_calls == [True, False, True])
+
 # --- lifecycle ---
 d1.disconnect()
 pl = first(mobile, "peer_left")
